@@ -1,9 +1,15 @@
 getgenv().Webhook = ""
 getgenv().StaffDetector = true
 getgenv().UseMask = true
-getgenv().Disable3DRender = true
-getgenv().BlackScreen = true
+getgenv().Disable3DRender = false
+getgenv().BlackScreen = false
 getgenv().FPSCap = 0
+getgenv().DoorMethod = "grenade_tp"
+getgenv().SilentAimVaults = true
+getgenv().BulletTPVaults = true
+getgenv().CashDepth = 6
+getgenv().GunReach = 15
+getgenv().LowMemory = true
 
 local VaultFarmCode = [====[
 if getgenv().FarmPaused == nil then getgenv().FarmPaused = false end
@@ -29,21 +35,10 @@ local Stats = game:GetService("Stats")
 while not Players.LocalPlayer do task.wait() end
 local LocalPlayer = Players.LocalPlayer
 
-task.spawn(function()
-    local vim = game:GetService("VirtualInputManager")
-    while task.wait(300) and getgenv().VaultSessionToken == sessionToken do
-        pcall(function()
-            vim:SendMouseButtonEvent(0, 0, 0, true, game, 0)
-            task.wait(0.05)
-            vim:SendMouseButtonEvent(0, 0, 0, false, game, 0)
-        end)
-    end
-end)
-
 -- settings changed from the menu are remembered across hops and restarts; the values at the
 -- top of the script only act as defaults until the menu has saved something
 local CONFIG_FILE = "VaultFarm_Config.json"
-local CONFIG_KEYS = {"StaffDetector", "UseMask", "Disable3DRender", "BlackScreen", "FPSCap", "StopKeybindName"}
+local CONFIG_KEYS = {"StaffDetector", "UseMask", "Disable3DRender", "BlackScreen", "FPSCap", "StopKeybindName", "CashDepth", "GunReach", "LowMemory"}
 local savedConfig = {}
 pcall(function()
     local data = HttpService:JSONDecode(readfile(CONFIG_FILE))
@@ -67,6 +62,60 @@ local function applyPerformanceSettings()
     if setfpscap and cap > 0 then pcall(setfpscap, cap) end
 end
 applyPerformanceSettings()
+
+-- Low memory mode: strips what only makes the map look nicer (particles, decals and textures, PBR
+-- surfaces, post effects, shadows, top graphics quality) and keeps doing it for whatever shows up
+-- later (shot effects, debris). Parts, scripts, sounds and anything inside a tool are never touched,
+-- so nothing the farm or the game's own scripts rely on goes missing. What's stripped only comes
+-- back by rejoining; turning it off just stops stripping new things.
+local applyLowMemory
+do
+    local conn
+    local STRIP = {
+        ParticleEmitter = true, Trail = true, Beam = true, Smoke = true, Fire = true, Sparkles = true,
+        Decal = true, Texture = true, SurfaceAppearance = true,
+    }
+    local function strip(obj)
+        if STRIP[obj.ClassName] then
+            if not obj:FindFirstAncestorWhichIsA("Tool") then pcall(function() obj:Destroy() end) end
+        elseif obj:IsA("MeshPart") and obj.TextureID ~= "" and not obj:FindFirstAncestorWhichIsA("Tool") then
+            pcall(function() obj.TextureID = "" end)
+        end
+    end
+    function applyLowMemory(on)
+        if conn then
+            conn:Disconnect()
+            conn = nil
+        end
+        pcall(function()
+            settings().Rendering.QualityLevel = on and Enum.QualityLevel.Level01 or Enum.QualityLevel.Automatic
+        end)
+        if not on then return end
+        local Lighting = game:GetService("Lighting")
+        pcall(function() Lighting.GlobalShadows = false end)
+        for _, effect in ipairs(Lighting:GetChildren()) do
+            if effect:IsA("PostEffect") then pcall(function() effect.Enabled = false end) end
+        end
+        local myConn
+        myConn = workspace.DescendantAdded:Connect(function(obj)
+            if getgenv().VaultSessionToken ~= sessionToken then
+                myConn:Disconnect()
+                return
+            end
+            strip(obj)
+        end)
+        conn = myConn
+        -- the map is already loaded: go through it in slices so the game doesn't freeze
+        task.spawn(function()
+            for i, obj in ipairs(workspace:GetDescendants()) do
+                if not myConn.Connected then return end
+                strip(obj)
+                if i % 3000 == 0 then task.wait() end
+            end
+        end)
+    end
+end
+applyLowMemory(getgenv().LowMemory ~= false)
 
 local safeFirePrompt = fireproximityprompt or function() end
 local safeFireTouch = function(part1, part2, state)
@@ -127,7 +176,8 @@ local function findShopPart(keyword)
                 local name = string.lower(obj.Name)
                 if not string.find(name, "carpet") and not string.find(name, "dhc") and not string.find(name, "skin") and not string.find(name, "crate") and not string.find(name, "launcher") then
                     if string.find(name, targetSearchName, 1, true) then
-                        if not (targetSearchName == "drum-shotgun" and string.find(name, "ammo")) then
+                        -- a weapon search must not land on that weapon's ammo stand ("drum-shotgun" vs "drum-shotgun ammo")
+                        if not (string.find(name, "ammo", 1, true) and not string.find(targetSearchName, "ammo", 1, true)) then
                             local cd = obj:FindFirstChildWhichIsA("ClickDetector", true)
                             local pp = obj:FindFirstChildWhichIsA("ProximityPrompt", true)
                             local part = obj:IsA("BasePart") and obj or obj:FindFirstChild("Head", true) or obj:FindFirstChildWhichIsA("BasePart", true)
@@ -155,6 +205,12 @@ local function triggerShopInteraction(shopPart, cd, pp)
         end)
     end
     task.wait(0.02)
+end
+
+-- parts left in the world by a previous run (re-executed without pressing Stop) are cleared first
+for _, name in ipairs({"AutoFarmPlatform", "VaultFarmCamera"}) do
+    local old = workspace:FindFirstChild(name)
+    if old then old:Destroy() end
 end
 
 local safePlatform = Instance.new("Part")
@@ -214,9 +270,6 @@ end
 shared.MoneyFarm = false
 shared.VaultFarm = true
 getgenv().IsHopping = false
-
-local n1 = 2
-local n2 = 35
 
 -- servers we've been in, stamped with when we were last there. Vaults refill about 16 minutes
 -- after being emptied, so a server becomes worth joining again once that much time has passed.
@@ -548,59 +601,62 @@ gui.Destroying:Connect(function()
 end)
 
 -- toasts
-local toastHolder = create("Frame", gui, {
-    AnchorPoint = Vector2.new(1, 1),
-    Position = UDim2.new(1, -20, 1, -20),
-    Size = UDim2.fromOffset(270, 300),
-    BackgroundTransparency = 1,
-})
-create("UIListLayout", toastHolder, {
-    Padding = UDim.new(0, 8),
-    VerticalAlignment = Enum.VerticalAlignment.Bottom,
-    SortOrder = Enum.SortOrder.LayoutOrder,
-})
-local toasts = {}
-local toastOrder = 0
-
-local function notify(title, text, color)
-    if not gui.Parent then return end
-    toastOrder = toastOrder + 1
-    local wrap = create("Frame", toastHolder, {LayoutOrder = toastOrder, Size = UDim2.new(1, 0, 0, 54), BackgroundTransparency = 1})
-    table.insert(toasts, wrap)
-    if #toasts > 4 then table.remove(toasts, 1):Destroy() end
-
-    local card = create("Frame", wrap, {
-        Position = UDim2.new(1, 30, 0, 0),
-        Size = UDim2.fromScale(1, 1),
-        BackgroundColor3 = Theme.Panel,
-        BackgroundTransparency = 0.06,
-        BorderSizePixel = 0,
+local notify
+do
+    local toastHolder = create("Frame", gui, {
+        AnchorPoint = Vector2.new(1, 1),
+        Position = UDim2.new(1, -20, 1, -20),
+        Size = UDim2.fromOffset(270, 300),
+        BackgroundTransparency = 1,
     })
-    corner(card, 14)
-    specular(card, 0.65)
-    local dot = create("Frame", card, {
-        AnchorPoint = Vector2.new(0, 0.5),
-        Position = UDim2.new(0, 14, 0.5, 0),
-        Size = UDim2.fromOffset(8, 8),
-        BackgroundColor3 = color or Theme.Accent,
-        BorderSizePixel = 0,
+    create("UIListLayout", toastHolder, {
+        Padding = UDim.new(0, 8),
+        VerticalAlignment = Enum.VerticalAlignment.Bottom,
+        SortOrder = Enum.SortOrder.LayoutOrder,
     })
-    corner(dot, UDim.new(1, 0))
-    label(card, {Position = UDim2.fromOffset(32, 9), Size = UDim2.new(1, -44, 0, 18), Text = title, FontFace = font(Enum.FontWeight.SemiBold), TextSize = 13})
-    label(card, {Position = UDim2.fromOffset(32, 27), Size = UDim2.new(1, -44, 0, 16), Text = text, TextSize = 12, TextColor3 = Theme.Muted, TextTruncate = Enum.TextTruncate.AtEnd})
+    local toasts = {}
+    local toastOrder = 0
 
-    tween(card, 0.55, {Position = UDim2.fromScale(0, 0)}, Enum.EasingStyle.Back)
-    task.delay(3.5, function()
-        if not card.Parent then return end
-        tween(card, 0.3, {Position = UDim2.new(1, 30, 0, 0)}, Enum.EasingStyle.Quad, Enum.EasingDirection.In).Completed:Wait()
-        local i = table.find(toasts, wrap)
-        if i then table.remove(toasts, i) end
-        wrap:Destroy()
-    end)
+    function notify(title, text, color)
+        if not gui.Parent then return end
+        toastOrder = toastOrder + 1
+        local wrap = create("Frame", toastHolder, {LayoutOrder = toastOrder, Size = UDim2.new(1, 0, 0, 54), BackgroundTransparency = 1})
+        table.insert(toasts, wrap)
+        if #toasts > 4 then table.remove(toasts, 1):Destroy() end
+
+        local card = create("Frame", wrap, {
+            Position = UDim2.new(1, 30, 0, 0),
+            Size = UDim2.fromScale(1, 1),
+            BackgroundColor3 = Theme.Panel,
+            BackgroundTransparency = 0.06,
+            BorderSizePixel = 0,
+        })
+        corner(card, 14)
+        specular(card, 0.65)
+        local dot = create("Frame", card, {
+            AnchorPoint = Vector2.new(0, 0.5),
+            Position = UDim2.new(0, 14, 0.5, 0),
+            Size = UDim2.fromOffset(8, 8),
+            BackgroundColor3 = color or Theme.Accent,
+            BorderSizePixel = 0,
+        })
+        corner(dot, UDim.new(1, 0))
+        label(card, {Position = UDim2.fromOffset(32, 9), Size = UDim2.new(1, -44, 0, 18), Text = title, FontFace = font(Enum.FontWeight.SemiBold), TextSize = 13})
+        label(card, {Position = UDim2.fromOffset(32, 27), Size = UDim2.new(1, -44, 0, 16), Text = text, TextSize = 12, TextColor3 = Theme.Muted, TextTruncate = Enum.TextTruncate.AtEnd})
+
+        tween(card, 0.55, {Position = UDim2.fromScale(0, 0)}, Enum.EasingStyle.Back)
+        task.delay(3.5, function()
+            if not card.Parent then return end
+            tween(card, 0.3, {Position = UDim2.new(1, 30, 0, 0)}, Enum.EasingStyle.Quad, Enum.EasingDirection.In).Completed:Wait()
+            local i = table.find(toasts, wrap)
+            if i then table.remove(toasts, i) end
+            wrap:Destroy()
+        end)
+    end
 end
 
 -- window
--- starts on the left so it stays clear of the screen center, where the farm clicks
+-- starts on the left, out of the way of the game view
 local DEFAULT_PANEL_POS = UDim2.new(0, 24, 0.5, -FULL_H / 2)
 local savedPos = savedConfig.PanelPosition
 local holder = create("Frame", gui, {
@@ -881,143 +937,147 @@ local function historyRate()
     return earned / (seconds / 3600)
 end
 
-local function formatDuration(seconds)
-    seconds = math.floor(seconds)
-    if seconds >= 3600 then return string.format("%dh %dm", math.floor(seconds / 3600), math.floor(seconds % 3600 / 60)) end
-    if seconds >= 60 then return string.format("%dm %ds", math.floor(seconds / 60), seconds % 60) end
-    return seconds .. "s"
-end
-
-local function entryAt(i)
-    return history[#history - BAR_COUNT + i]
-end
-
-local chart = glass(dashboard, {Position = UDim2.fromOffset(0, 172), Size = UDim2.new(1, 0, 0, 98)}, nil, 16)
-table.insert(dashCards, {chart, chart.Position})
-label(chart, {
-    Position = UDim2.fromOffset(16, 12),
-    Size = UDim2.new(0.5, 0, 0, 14),
-    Text = "Servers",
-    TextSize = 12,
-    TextColor3 = Theme.Muted,
-})
-local chartCount = label(chart, {
-    AnchorPoint = Vector2.new(1, 0),
-    Position = UDim2.new(1, -16, 0, 12),
-    Size = UDim2.new(0.5, 0, 0, 14),
-    Text = "",
-    TextSize = 11,
-    TextColor3 = Theme.Dim,
-    TextXAlignment = Enum.TextXAlignment.Right,
-})
-local barArea = create("Frame", chart, {
-    Position = UDim2.fromOffset(16, 34),
-    Size = UDim2.new(1, -32, 1, -48),
-    BackgroundTransparency = 1,
-})
-
-local tooltip = create("Frame", chart, {
-    AnchorPoint = Vector2.new(0.5, 1),
-    Size = UDim2.fromOffset(150, 60),
-    BackgroundColor3 = Theme.Panel,
-    BackgroundTransparency = 0.02,
-    BorderSizePixel = 0,
-    Visible = false,
-    ZIndex = 10,
-})
-corner(tooltip, 12)
-specular(tooltip, 0.6)
-local tooltipScale = create("UIScale", tooltip, {Scale = 0.9})
-local tipTitle = label(tooltip, {Position = UDim2.fromOffset(12, 8), Size = UDim2.new(1, -24, 0, 14), TextSize = 11, TextColor3 = Theme.Muted, ZIndex = 11})
-local tipMoney = label(tooltip, {Position = UDim2.fromOffset(12, 22), Size = UDim2.new(1, -24, 0, 18), FontFace = font(Enum.FontWeight.Bold), TextSize = 15, ZIndex = 11})
-local tipMeta = label(tooltip, {Position = UDim2.fromOffset(12, 41), Size = UDim2.new(1, -24, 0, 12), TextSize = 10, TextColor3 = Theme.Dim, TextTruncate = Enum.TextTruncate.AtEnd, ZIndex = 11})
-
-local bars, barHeights = {}, {}
-local hoveredIndex
-
-local function hideTooltip()
-    if not tooltip.Visible then return end
-    tween(tooltipScale, 0.12, {Scale = 0.9}, Enum.EasingStyle.Quad, Enum.EasingDirection.In).Completed:Connect(function()
-        if not hoveredIndex then tooltip.Visible = false end
-    end)
-end
-
-local function showTooltip(i, instant)
-    local e = entryAt(i)
-    if not e then
-        hideTooltip()
-        return
+-- everything the chart needs lives in this block; only renderChart is used outside it
+local renderChart
+do
+    local function formatDuration(seconds)
+        seconds = math.floor(seconds)
+        if seconds >= 3600 then return string.format("%dh %dm", math.floor(seconds / 3600), math.floor(seconds % 3600 / 60)) end
+        if seconds >= 60 then return string.format("%dm %ds", math.floor(seconds / 60), seconds % 60) end
+        return seconds .. "s"
     end
-    local isCurrent = e == currentEntry
-    tipTitle.Text = isCurrent and "This server" or ("Server #" .. (#history - BAR_COUNT + i))
-    tipMoney.Text = "$" .. FormatMoney(math.floor(e.earned))
-    tipMoney.TextColor3 = isCurrent and Theme.Green or Theme.Text
-    tipMeta.Text = string.sub(tostring(e.id), 1, 8) .. "  ·  " .. formatDuration(e.seconds)
 
-    -- place it above the bar's final height, from sizes only so the reveal animation can't skew it
-    local areaSize = barArea.AbsoluteSize
-    local x = math.clamp(16 + areaSize.X * (i - 0.5) / BAR_COUNT, 80, chart.AbsoluteSize.X - 80)
-    local y = 34 + areaSize.Y * (1 - barHeights[i]) - 6
-    local target = UDim2.fromOffset(x, y)
-    if not tooltip.Visible then
-        tooltip.Position = target + UDim2.fromOffset(0, 6)
-        tooltip.Visible = true
-        tooltipScale.Scale = 0.9
-        tween(tooltipScale, 0.35, {Scale = 1}, Enum.EasingStyle.Back)
+    local function entryAt(i)
+        return history[#history - BAR_COUNT + i]
     end
-    tween(tooltip, instant and 0 or 0.2, {Position = target})
-end
 
-local function renderChart()
-    local maxValue = 0
-    for _, e in ipairs(history) do
-        if e.earned > maxValue then maxValue = e.earned end
-    end
-    for i = 1, BAR_COUNT do
-        local e = entryAt(i)
-        local h = (e and maxValue > 0) and math.max(e.earned / maxValue, 0.08) or 0.08
-        barHeights[i] = h
-        local color, transparency = Theme.White, 0.92
-        if e then
-            local isCurrent = e == currentEntry
-            color = isCurrent and Theme.Green or Theme.White
-            transparency = hoveredIndex == i and 0 or (isCurrent and 0.1 or 0.55)
-        end
-        tween(bars[i], 0.6, {Size = UDim2.new(1, -4, h, 0), BackgroundColor3 = color, BackgroundTransparency = transparency})
-    end
-    chartCount.Text = #history == 1 and "1 server" or (#history .. " servers")
-    if hoveredIndex then showTooltip(hoveredIndex, true) end
-end
-
-for i = 1, BAR_COUNT do
-    local column = create("Frame", barArea, {
-        Position = UDim2.fromScale((i - 1) / BAR_COUNT, 0),
-        Size = UDim2.fromScale(1 / BAR_COUNT, 1),
+    local chart = glass(dashboard, {Position = UDim2.fromOffset(0, 172), Size = UDim2.new(1, 0, 0, 98)}, nil, 16)
+    table.insert(dashCards, {chart, chart.Position})
+    label(chart, {
+        Position = UDim2.fromOffset(16, 12),
+        Size = UDim2.new(0.5, 0, 0, 14),
+        Text = "Servers",
+        TextSize = 12,
+        TextColor3 = Theme.Muted,
+    })
+    local chartCount = label(chart, {
+        AnchorPoint = Vector2.new(1, 0),
+        Position = UDim2.new(1, -16, 0, 12),
+        Size = UDim2.new(0.5, 0, 0, 14),
+        Text = "",
+        TextSize = 11,
+        TextColor3 = Theme.Dim,
+        TextXAlignment = Enum.TextXAlignment.Right,
+    })
+    local barArea = create("Frame", chart, {
+        Position = UDim2.fromOffset(16, 34),
+        Size = UDim2.new(1, -32, 1, -48),
         BackgroundTransparency = 1,
     })
-    local bar = create("Frame", column, {
+
+    local tooltip = create("Frame", chart, {
         AnchorPoint = Vector2.new(0.5, 1),
-        Position = UDim2.fromScale(0.5, 1),
-        Size = UDim2.new(1, -4, 0.08, 0),
-        BackgroundColor3 = Theme.White,
-        BackgroundTransparency = 0.92,
+        Size = UDim2.fromOffset(150, 60),
+        BackgroundColor3 = Theme.Panel,
+        BackgroundTransparency = 0.02,
         BorderSizePixel = 0,
+        Visible = false,
+        ZIndex = 10,
     })
-    corner(bar, 3)
-    bars[i], barHeights[i] = bar, 0.08
-    column.MouseEnter:Connect(function()
-        hoveredIndex = i
-        renderChart()
-        showTooltip(i)
-    end)
-    column.MouseLeave:Connect(function()
-        if hoveredIndex ~= i then return end
-        hoveredIndex = nil
-        renderChart()
-        hideTooltip()
-    end)
+    corner(tooltip, 12)
+    specular(tooltip, 0.6)
+    local tooltipScale = create("UIScale", tooltip, {Scale = 0.9})
+    local tipTitle = label(tooltip, {Position = UDim2.fromOffset(12, 8), Size = UDim2.new(1, -24, 0, 14), TextSize = 11, TextColor3 = Theme.Muted, ZIndex = 11})
+    local tipMoney = label(tooltip, {Position = UDim2.fromOffset(12, 22), Size = UDim2.new(1, -24, 0, 18), FontFace = font(Enum.FontWeight.Bold), TextSize = 15, ZIndex = 11})
+    local tipMeta = label(tooltip, {Position = UDim2.fromOffset(12, 41), Size = UDim2.new(1, -24, 0, 12), TextSize = 10, TextColor3 = Theme.Dim, TextTruncate = Enum.TextTruncate.AtEnd, ZIndex = 11})
+
+    local bars, barHeights = {}, {}
+    local hoveredIndex
+
+    local function hideTooltip()
+        if not tooltip.Visible then return end
+        tween(tooltipScale, 0.12, {Scale = 0.9}, Enum.EasingStyle.Quad, Enum.EasingDirection.In).Completed:Connect(function()
+            if not hoveredIndex then tooltip.Visible = false end
+        end)
+    end
+
+    local function showTooltip(i, instant)
+        local e = entryAt(i)
+        if not e then
+            hideTooltip()
+            return
+        end
+        local isCurrent = e == currentEntry
+        tipTitle.Text = isCurrent and "This server" or ("Server #" .. (#history - BAR_COUNT + i))
+        tipMoney.Text = "$" .. FormatMoney(math.floor(e.earned))
+        tipMoney.TextColor3 = isCurrent and Theme.Green or Theme.Text
+        tipMeta.Text = string.sub(tostring(e.id), 1, 8) .. "  ·  " .. formatDuration(e.seconds)
+
+        -- place it above the bar's final height, from sizes only so the reveal animation can't skew it
+        local areaSize = barArea.AbsoluteSize
+        local x = math.clamp(16 + areaSize.X * (i - 0.5) / BAR_COUNT, 80, chart.AbsoluteSize.X - 80)
+        local y = 34 + areaSize.Y * (1 - barHeights[i]) - 6
+        local target = UDim2.fromOffset(x, y)
+        if not tooltip.Visible then
+            tooltip.Position = target + UDim2.fromOffset(0, 6)
+            tooltip.Visible = true
+            tooltipScale.Scale = 0.9
+            tween(tooltipScale, 0.35, {Scale = 1}, Enum.EasingStyle.Back)
+        end
+        tween(tooltip, instant and 0 or 0.2, {Position = target})
+    end
+
+    function renderChart()
+        local maxValue = 0
+        for _, e in ipairs(history) do
+            if e.earned > maxValue then maxValue = e.earned end
+        end
+        for i = 1, BAR_COUNT do
+            local e = entryAt(i)
+            local h = (e and maxValue > 0) and math.max(e.earned / maxValue, 0.08) or 0.08
+            barHeights[i] = h
+            local color, transparency = Theme.White, 0.92
+            if e then
+                local isCurrent = e == currentEntry
+                color = isCurrent and Theme.Green or Theme.White
+                transparency = hoveredIndex == i and 0 or (isCurrent and 0.1 or 0.55)
+            end
+            tween(bars[i], 0.6, {Size = UDim2.new(1, -4, h, 0), BackgroundColor3 = color, BackgroundTransparency = transparency})
+        end
+        chartCount.Text = #history == 1 and "1 server" or (#history .. " servers")
+        if hoveredIndex then showTooltip(hoveredIndex, true) end
+    end
+
+    for i = 1, BAR_COUNT do
+        local column = create("Frame", barArea, {
+            Position = UDim2.fromScale((i - 1) / BAR_COUNT, 0),
+            Size = UDim2.fromScale(1 / BAR_COUNT, 1),
+            BackgroundTransparency = 1,
+        })
+        local bar = create("Frame", column, {
+            AnchorPoint = Vector2.new(0.5, 1),
+            Position = UDim2.fromScale(0.5, 1),
+            Size = UDim2.new(1, -4, 0.08, 0),
+            BackgroundColor3 = Theme.White,
+            BackgroundTransparency = 0.92,
+            BorderSizePixel = 0,
+        })
+        corner(bar, 3)
+        bars[i], barHeights[i] = bar, 0.08
+        column.MouseEnter:Connect(function()
+            hoveredIndex = i
+            renderChart()
+            showTooltip(i)
+        end)
+        column.MouseLeave:Connect(function()
+            if hoveredIndex ~= i then return end
+            hoveredIndex = nil
+            renderChart()
+            hideTooltip()
+        end)
+    end
+    renderChart()
 end
-renderChart()
 
 task.spawn(function()
     while running() and gui.Parent do
@@ -1075,6 +1135,7 @@ moneyValue.Value = sessionMoney
 moneyValue.Changed:Connect(function(v)
     cashCounter.Text = "$" .. FormatMoney(math.floor(v + 0.5))
 end)
+gui.Destroying:Connect(function() moneyValue:Destroy() end)
 
 local function onMoneyGained(diff)
     tween(moneyValue, 1, {Value = sessionMoney}, Enum.EasingStyle.Quart)
@@ -1103,158 +1164,204 @@ local function onMoneyGained(diff)
 end
 
 -- settings
-local function settingRow(order, iconName, title, desc)
-    local row = glass(settingsPage, {Position = UDim2.fromOffset(0, (order - 1) * 54), Size = UDim2.new(1, 0, 0, 46)}, nil, 14)
-    table.insert(settingsCards, {row, row.Position})
-    local img = icon(row, iconName, 18, {AnchorPoint = Vector2.new(0, 0.5), Position = UDim2.new(0, 14, 0.5, 0), ImageColor3 = Theme.Muted})
-    local x = img and 44 or 16
-    label(row, {
-        Position = UDim2.fromOffset(x, 7),
-        Size = UDim2.new(1, -x - 110, 0, 17),
-        Text = title,
+-- the settings rows only need their helpers while they're being built
+local KeybindBtn
+do
+    local function settingRow(order, iconName, title, desc)
+        local row = glass(settingsPage, {Position = UDim2.fromOffset(0, (order - 1) * 54), Size = UDim2.new(1, 0, 0, 46)}, nil, 14)
+        table.insert(settingsCards, {row, row.Position})
+        local img = icon(row, iconName, 18, {AnchorPoint = Vector2.new(0, 0.5), Position = UDim2.new(0, 14, 0.5, 0), ImageColor3 = Theme.Muted})
+        local x = img and 44 or 16
+        label(row, {
+            Position = UDim2.fromOffset(x, 7),
+            Size = UDim2.new(1, -x - 110, 0, 17),
+            Text = title,
+            FontFace = font(Enum.FontWeight.SemiBold),
+            TextSize = 13,
+        })
+        label(row, {
+            Position = UDim2.fromOffset(x, 24),
+            Size = UDim2.new(1, -x - 110, 0, 14),
+            Text = desc,
+            TextSize = 11,
+            TextColor3 = Theme.Dim,
+            TextTruncate = Enum.TextTruncate.AtEnd,
+        })
+        return row
+    end
+
+    local function createToggle(order, iconName, title, desc, initial, onChange)
+        local row = settingRow(order, iconName, title, desc)
+        local hit = create("TextButton", row, {
+            Size = UDim2.fromScale(1, 1),
+            BackgroundTransparency = 1,
+            AutoButtonColor = false,
+            Text = "",
+            ZIndex = 3,
+        })
+        local track = create("Frame", row, {
+            AnchorPoint = Vector2.new(1, 0.5),
+            Position = UDim2.new(1, -14, 0.5, 0),
+            Size = UDim2.fromOffset(44, 26),
+            BackgroundColor3 = Theme.Track,
+            BorderSizePixel = 0,
+        })
+        corner(track, UDim.new(1, 0))
+        local knob = create("Frame", track, {
+            AnchorPoint = Vector2.new(0, 0.5),
+            Position = UDim2.new(0, 2, 0.5, 0),
+            Size = UDim2.fromOffset(22, 22),
+            BackgroundColor3 = Theme.White,
+            BorderSizePixel = 0,
+        })
+        corner(knob, UDim.new(1, 0))
+        create("UIStroke", knob, {Color = Theme.Black, Transparency = 0.85, Thickness = 1})
+
+        local state = initial
+        local function render(animate)
+            tween(track, animate and 0.25 or 0, {BackgroundColor3 = state and Theme.Green or Theme.Track}, Enum.EasingStyle.Quad)
+            tween(knob, animate and 0.45 or 0, {
+                AnchorPoint = state and Vector2.new(1, 0.5) or Vector2.new(0, 0.5),
+                Position = state and UDim2.new(1, -2, 0.5, 0) or UDim2.new(0, 2, 0.5, 0),
+                Size = UDim2.fromOffset(22, 22),
+            }, Enum.EasingStyle.Back)
+        end
+        render(false)
+
+        -- the knob stretches while pressed, like iOS
+        hit.MouseButton1Down:Connect(function() tween(knob, 0.15, {Size = UDim2.fromOffset(27, 22)}, Enum.EasingStyle.Quad) end)
+        hit.MouseEnter:Connect(function() tween(row, 0.2, {BackgroundTransparency = 0.935}) end)
+        hit.MouseLeave:Connect(function()
+            tween(row, 0.2, {BackgroundTransparency = 0.955})
+            tween(knob, 0.2, {Size = UDim2.fromOffset(22, 22)})
+        end)
+        hit.MouseButton1Click:Connect(function()
+            state = not state
+            render(true)
+            onChange(state)
+            saveConfig()
+            notify(title, state and "On" or "Off", state and Theme.Green or Theme.Muted)
+        end)
+    end
+
+    createToggle(1, "screen", "Black screen", "Covers the game", getgenv().BlackScreen == true, function(on)
+        getgenv().BlackScreen = on
+        blackGui.Enabled = on
+    end)
+    createToggle(2, "cube", "Disable 3D render", "Saves CPU and GPU", getgenv().Disable3DRender == true, function(on)
+        getgenv().Disable3DRender = on
+        applyPerformanceSettings()
+    end)
+    createToggle(3, "cube", "Low memory mode", "Strips effects and textures, rejoin to undo", getgenv().LowMemory ~= false, function(on)
+        getgenv().LowMemory = on
+        applyLowMemory(on)
+    end)
+    createToggle(4, "shield", "Staff detector", "Hops when staff joins", getgenv().StaffDetector ~= false, function(on)
+        getgenv().StaffDetector = on
+    end)
+    createToggle(5, "mask", "Use mask", "Hides your name, applies on respawn", getgenv().UseMask ~= false, function(on)
+        getgenv().UseMask = on
+    end)
+
+    local fpsOptions = {0, 15, 30, 60, 120}
+    local fpsIndex = 1
+    for i, v in ipairs(fpsOptions) do
+        if v == (tonumber(getgenv().FPSCap) or 0) then fpsIndex = i end
+    end
+    local fpsRow = settingRow(6, "gauge", "FPS cap", "Limit frames per second")
+    local fpsValue = label(fpsRow, {
+        AnchorPoint = Vector2.new(1, 0.5),
+        Position = UDim2.new(1, -42, 0.5, 0),
+        Size = UDim2.fromOffset(40, 20),
         FontFace = font(Enum.FontWeight.SemiBold),
         TextSize = 13,
+        TextXAlignment = Enum.TextXAlignment.Center,
     })
-    label(row, {
-        Position = UDim2.fromOffset(x, 24),
-        Size = UDim2.new(1, -x - 110, 0, 14),
-        Text = desc,
-        TextSize = 11,
-        TextColor3 = Theme.Dim,
-        TextTruncate = Enum.TextTruncate.AtEnd,
-    })
-    return row
-end
+    local function renderFps(animate)
+        local v = fpsOptions[fpsIndex]
+        fpsValue.Text = v == 0 and "Off" or tostring(v)
+        if animate then
+            fpsValue.TextTransparency = 1
+            tween(fpsValue, 0.25, {TextTransparency = 0})
+        end
+    end
+    renderFps(false)
+    local function fpsArrow(glyph, xOffset, delta)
+        local b = glass(fpsRow, {
+            AnchorPoint = Vector2.new(1, 0.5),
+            Position = UDim2.new(1, xOffset, 0.5, 0),
+            Size = UDim2.fromOffset(26, 26),
+            BackgroundTransparency = 0.93,
+        }, "TextButton", 13)
+        label(b, {Size = UDim2.fromScale(1, 1), Text = glyph, FontFace = font(Enum.FontWeight.SemiBold), TextSize = 15, TextXAlignment = Enum.TextXAlignment.Center})
+        addPressEffect(b)
+        b.MouseButton1Click:Connect(function()
+            local nextIndex = math.clamp(fpsIndex + delta, 1, #fpsOptions)
+            if nextIndex == fpsIndex then return end
+            fpsIndex = nextIndex
+            local v = fpsOptions[fpsIndex]
+            getgenv().FPSCap = v
+            saveConfig()
+            renderFps(true)
+            if setfpscap then pcall(setfpscap, v > 0 and v or 999) end
+        end)
+    end
+    fpsArrow("‹", -84, -1)
+    fpsArrow("›", -14, 1)
 
-local function createToggle(order, iconName, title, desc, initial, onChange)
-    local row = settingRow(order, iconName, title, desc)
-    local hit = create("TextButton", row, {
-        Size = UDim2.fromScale(1, 1),
-        BackgroundTransparency = 1,
-        AutoButtonColor = false,
-        Text = "",
-        ZIndex = 3,
-    })
-    local track = create("Frame", row, {
+    -- a whole-number setting stepped with ‹ ›, saved with the rest of the config
+    local function numberRow(order, title, desc, key, default, min, max)
+        local row = settingRow(order, "gauge", title, desc)
+        getgenv()[key] = math.clamp(math.floor(tonumber(getgenv()[key]) or default), min, max)
+        local valueLabel = label(row, {
+            AnchorPoint = Vector2.new(1, 0.5),
+            Position = UDim2.new(1, -42, 0.5, 0),
+            Size = UDim2.fromOffset(40, 20),
+            FontFace = font(Enum.FontWeight.SemiBold),
+            TextSize = 13,
+            TextXAlignment = Enum.TextXAlignment.Center,
+            Text = tostring(getgenv()[key]),
+        })
+        local function arrow(glyph, xOffset, delta)
+            local b = glass(row, {
+                AnchorPoint = Vector2.new(1, 0.5),
+                Position = UDim2.new(1, xOffset, 0.5, 0),
+                Size = UDim2.fromOffset(26, 26),
+                BackgroundTransparency = 0.93,
+            }, "TextButton", 13)
+            label(b, {Size = UDim2.fromScale(1, 1), Text = glyph, FontFace = font(Enum.FontWeight.SemiBold), TextSize = 15, TextXAlignment = Enum.TextXAlignment.Center})
+            addPressEffect(b)
+            b.MouseButton1Click:Connect(function()
+                local v = math.clamp(getgenv()[key] + delta, min, max)
+                if v == getgenv()[key] then return end
+                getgenv()[key] = v
+                saveConfig()
+                valueLabel.Text = tostring(v)
+                valueLabel.TextTransparency = 1
+                tween(valueLabel, 0.25, {TextTransparency = 0})
+            end)
+        end
+        arrow("‹", -84, -1)
+        arrow("›", -14, 1)
+    end
+    numberRow(7, "Cash depth", "Studs below the cash when picking it up", "CashDepth", 6, 1, 15)
+    numberRow(8, "Gun reach", "Max studs the gun goes from you", "GunReach", 15, 5, 30)
+
+    local keyRow = settingRow(9, "keyboard", "Stop key", "Right Shift hides the menu")
+    settingsPage.CanvasSize = UDim2.fromOffset(0, #settingsCards * 54 - 8)
+    KeybindBtn = glass(keyRow, {
         AnchorPoint = Vector2.new(1, 0.5),
         Position = UDim2.new(1, -14, 0.5, 0),
-        Size = UDim2.fromOffset(44, 26),
-        BackgroundColor3 = Theme.Track,
-        BorderSizePixel = 0,
-    })
-    corner(track, UDim.new(1, 0))
-    local knob = create("Frame", track, {
-        AnchorPoint = Vector2.new(0, 0.5),
-        Position = UDim2.new(0, 2, 0.5, 0),
-        Size = UDim2.fromOffset(22, 22),
-        BackgroundColor3 = Theme.White,
-        BorderSizePixel = 0,
-    })
-    corner(knob, UDim.new(1, 0))
-    create("UIStroke", knob, {Color = Theme.Black, Transparency = 0.85, Thickness = 1})
-
-    local state = initial
-    local function render(animate)
-        tween(track, animate and 0.25 or 0, {BackgroundColor3 = state and Theme.Green or Theme.Track}, Enum.EasingStyle.Quad)
-        tween(knob, animate and 0.45 or 0, {
-            AnchorPoint = state and Vector2.new(1, 0.5) or Vector2.new(0, 0.5),
-            Position = state and UDim2.new(1, -2, 0.5, 0) or UDim2.new(0, 2, 0.5, 0),
-            Size = UDim2.fromOffset(22, 22),
-        }, Enum.EasingStyle.Back)
-    end
-    render(false)
-
-    -- the knob stretches while pressed, like iOS
-    hit.MouseButton1Down:Connect(function() tween(knob, 0.15, {Size = UDim2.fromOffset(27, 22)}, Enum.EasingStyle.Quad) end)
-    hit.MouseEnter:Connect(function() tween(row, 0.2, {BackgroundTransparency = 0.935}) end)
-    hit.MouseLeave:Connect(function()
-        tween(row, 0.2, {BackgroundTransparency = 0.955})
-        tween(knob, 0.2, {Size = UDim2.fromOffset(22, 22)})
-    end)
-    hit.MouseButton1Click:Connect(function()
-        state = not state
-        render(true)
-        onChange(state)
-        saveConfig()
-        notify(title, state and "On" or "Off", state and Theme.Green or Theme.Muted)
-    end)
+        Size = UDim2.fromOffset(84, 28),
+        BackgroundTransparency = 0.92,
+        Text = "None",
+        FontFace = font(Enum.FontWeight.SemiBold),
+        TextSize = 12,
+        TextColor3 = Theme.Text,
+        TextTruncate = Enum.TextTruncate.AtEnd,
+    }, "TextButton", 9)
+    addPressEffect(KeybindBtn)
 end
-
-createToggle(1, "screen", "Black screen", "Covers the game", getgenv().BlackScreen == true, function(on)
-    getgenv().BlackScreen = on
-    blackGui.Enabled = on
-end)
-createToggle(2, "cube", "Disable 3D render", "Saves CPU and GPU", getgenv().Disable3DRender == true, function(on)
-    getgenv().Disable3DRender = on
-    applyPerformanceSettings()
-end)
-createToggle(3, "shield", "Staff detector", "Hops when staff joins", getgenv().StaffDetector ~= false, function(on)
-    getgenv().StaffDetector = on
-end)
-createToggle(4, "mask", "Use mask", "Hides your name, applies on respawn", getgenv().UseMask ~= false, function(on)
-    getgenv().UseMask = on
-end)
-
-local fpsOptions = {0, 15, 30, 60, 120}
-local fpsIndex = 1
-for i, v in ipairs(fpsOptions) do
-    if v == (tonumber(getgenv().FPSCap) or 0) then fpsIndex = i end
-end
-local fpsRow = settingRow(5, "gauge", "FPS cap", "Limit frames per second")
-local fpsValue = label(fpsRow, {
-    AnchorPoint = Vector2.new(1, 0.5),
-    Position = UDim2.new(1, -42, 0.5, 0),
-    Size = UDim2.fromOffset(40, 20),
-    FontFace = font(Enum.FontWeight.SemiBold),
-    TextSize = 13,
-    TextXAlignment = Enum.TextXAlignment.Center,
-})
-local function renderFps(animate)
-    local v = fpsOptions[fpsIndex]
-    fpsValue.Text = v == 0 and "Off" or tostring(v)
-    if animate then
-        fpsValue.TextTransparency = 1
-        tween(fpsValue, 0.25, {TextTransparency = 0})
-    end
-end
-renderFps(false)
-local function fpsArrow(glyph, xOffset, delta)
-    local b = glass(fpsRow, {
-        AnchorPoint = Vector2.new(1, 0.5),
-        Position = UDim2.new(1, xOffset, 0.5, 0),
-        Size = UDim2.fromOffset(26, 26),
-        BackgroundTransparency = 0.93,
-    }, "TextButton", 13)
-    label(b, {Size = UDim2.fromScale(1, 1), Text = glyph, FontFace = font(Enum.FontWeight.SemiBold), TextSize = 15, TextXAlignment = Enum.TextXAlignment.Center})
-    addPressEffect(b)
-    b.MouseButton1Click:Connect(function()
-        local nextIndex = math.clamp(fpsIndex + delta, 1, #fpsOptions)
-        if nextIndex == fpsIndex then return end
-        fpsIndex = nextIndex
-        local v = fpsOptions[fpsIndex]
-        getgenv().FPSCap = v
-        saveConfig()
-        renderFps(true)
-        if setfpscap then pcall(setfpscap, v > 0 and v or 999) end
-    end)
-end
-fpsArrow("‹", -84, -1)
-fpsArrow("›", -14, 1)
-
-local keyRow = settingRow(6, "keyboard", "Stop key", "Right Shift hides the menu")
-settingsPage.CanvasSize = UDim2.fromOffset(0, #settingsCards * 54 - 8)
-local KeybindBtn = glass(keyRow, {
-    AnchorPoint = Vector2.new(1, 0.5),
-    Position = UDim2.new(1, -14, 0.5, 0),
-    Size = UDim2.fromOffset(84, 28),
-    BackgroundTransparency = 0.92,
-    Text = "None",
-    FontFace = font(Enum.FontWeight.SemiBold),
-    TextSize = 12,
-    TextColor3 = Theme.Text,
-    TextTruncate = Enum.TextTruncate.AtEnd,
-}, "TextButton", 9)
-addPressEffect(KeybindBtn)
 
 -- footer
 local footer = create("Frame", main, {
@@ -1362,6 +1469,45 @@ task.spawn(function()
     end
 end)
 
+-- heartbeat for the watchdog app outside Roblox: while the farm runs (hops included) it stamps the time
+-- every 15 s; it stops stamping while a disconnect/kick prompt is on screen, so the watchdog notices a
+-- stuck client and reopens it. Stop writes "stopped" so the watchdog leaves Roblox alone. One file per
+-- account, since several Roblox windows share the executor's workspace.
+task.spawn(function()
+    while getgenv().VaultSessionToken == sessionToken and (shared.VaultFarm or getgenv().IsHopping) do
+        local errorShown = false
+        pcall(function() errorShown = game:GetService("GuiService"):GetErrorMessage() ~= "" end)
+        if writefile and not errorShown then
+            pcall(function() writefile("VaultFarm_Heartbeat_" .. LocalPlayer.Name .. ".txt", "running " .. os.time()) end)
+        end
+        task.wait(15)
+    end
+end)
+
+-- anti-AFK without input: the 20-minute idle kick comes from a listener on LocalPlayer.Idled, and the farm's
+-- teleports don't count as input, so those listeners are switched off while the farm runs (re-checked every
+-- 30 s in case one gets connected later) and switched back on when it stops
+task.spawn(function()
+    local getconns = getconnections or get_signal_cons
+    if not getconns then return end
+    local function setIdleListeners(on)
+        pcall(function()
+            for _, conn in ipairs(getconns(LocalPlayer.Idled)) do
+                pcall(function()
+                    if on then conn:Enable()
+                    elseif conn.Disable then conn:Disable()
+                    else conn:Disconnect() end
+                end)
+            end
+        end)
+    end
+    while getgenv().VaultSessionToken == sessionToken and (shared.VaultFarm or getgenv().IsHopping) do
+        setIdleListeners(false)
+        task.wait(30)
+    end
+    setIdleListeners(true)
+end)
+
 -- a single heartbeat drives every sprite sheet, and only while the menu is on screen
 table.insert(uiConns, RunService.Heartbeat:Connect(function(dt)
     if not holder.Visible then return end
@@ -1398,24 +1544,12 @@ end)
 
 notify("Vault Farm", getgenv().VaultWebhookSent and "Joined a new server" or "Farm started", Theme.Accent)
 
--- every farm click goes through here: if the menu was dragged over the click point,
--- hide it for that instant so the click reaches the game instead of a menu button
-local function overlapsMenu(x, y)
-    if not gui.Parent or not gui.Enabled or not holder.Visible then return false end
-    local pos, size = main.AbsolutePosition, main.AbsoluteSize
-    return x >= pos.X and x <= pos.X + size.X and y >= pos.Y and y <= pos.Y + size.Y
-end
-
-local function clickCenter(holdTime)
-    local cam = workspace.CurrentCamera
-    if not cam then return end
-    local center = cam.ViewportSize / 2
-    local hide = overlapsMenu(center.X, center.Y)
-    if hide then gui.Enabled = false end
-    pcall(function() VIM:SendMouseButtonEvent(center.X, center.Y, 0, true, game, 0) end)
-    task.wait(holdTime or 0.05)
-    pcall(function() VIM:SendMouseButtonEvent(center.X, center.Y, 0, false, game, 0) end)
-    if hide and gui.Parent then gui.Enabled = true end
+-- uses an equipped tool the way a click does, without any mouse: Activate is the press and Deactivate
+-- the release, which is what the game's tool scripts listen to (the grenade throws on the release)
+local function pressTool(tool)
+    pcall(function() tool:Activate() end)
+    task.wait(0.05)
+    pcall(function() tool:Deactivate() end)
 end
 
 local renderConn
@@ -1501,6 +1635,10 @@ local function queueResume()
         local render3DState = tostring(getgenv().Disable3DRender == true)
         local blackState = tostring(getgenv().BlackScreen == true)
         local fpsCap = math.floor(tonumber(getgenv().FPSCap) or 0)
+        local doorMethod = getgenv().DoorMethod
+        if doorMethod ~= "grenade" then doorMethod = "grenade_tp" end
+        local silentAimState = tostring(getgenv().SilentAimVaults ~= false)
+        local bulletTPState = tostring(getgenv().BulletTPVaults ~= false)
         local totalTime = math.floor(getgenv().SavedSessionTime)
         local hopTime = os.time()
         
@@ -1521,8 +1659,13 @@ local function queueResume()
             getgenv().Disable3DRender = %s
             getgenv().BlackScreen = %s
             getgenv().FPSCap = %d
+            getgenv().DoorMethod = "%s"
+            getgenv().SilentAimVaults = %s
+            getgenv().BulletTPVaults = %s
             pcall(function()
                 if readfile and loadstring then
+                    local marker = "VaultFarm_Heartbeat_%s.txt"
+                    if isfile and isfile(marker) and readfile(marker) == "stopped" then return end
                     local cached = readfile("Vault_Cache.lua")
                     if cached and #cached > 10 then
                         local func = loadstring(cached)
@@ -1531,7 +1674,7 @@ local function queueResume()
                 end
             end)
         end)
-        ]], hopTime, sessionMoney or 0, totalTime, currentMask, skName, fpState, webhookUrl, staffState, maskState, render3DState, blackState, fpsCap)
+        ]], hopTime, sessionMoney or 0, totalTime, currentMask, skName, fpState, webhookUrl, staffState, maskState, render3DState, blackState, fpsCap, doorMethod, silentAimState, bulletTPState, LocalPlayer.Name)
         pcall(function() qot(qot_script) end)
     end
 end
@@ -1598,52 +1741,77 @@ end
 
 -- when Roblox shows a disconnect or kick prompt mid-farm, rejoin the game; the queued script
 -- picks the farm back up on the other side
-local GuiService = game:GetService("GuiService")
-local reconnecting = false
-local errorPromptConn
-errorPromptConn = GuiService.ErrorMessageChanged:Connect(function(message)
-    if getgenv().VaultSessionToken ~= sessionToken then
-        errorPromptConn:Disconnect()
-        return
-    end
-    if reconnecting or not message or message == "" then return end
-    if not (shared.VaultFarm or getgenv().IsHopping) then return end
-    reconnecting = true
-    saveHistory()
-    markVisited(tostring(game.JobId))
-    queueResume()
-    task.spawn(function()
-        while true do
-            pcall(function() TeleportService:Teleport(game.PlaceId, LocalPlayer) end)
-            task.wait(8)
+do
+    local GuiService = game:GetService("GuiService")
+    local reconnecting = false
+    local errorPromptConn
+    errorPromptConn = GuiService.ErrorMessageChanged:Connect(function(message)
+        if getgenv().VaultSessionToken ~= sessionToken then
+            errorPromptConn:Disconnect()
+            return
         end
+        if reconnecting or not message or message == "" then return end
+        if not (shared.VaultFarm or getgenv().IsHopping) then return end
+        reconnecting = true
+        saveHistory()
+        markVisited(tostring(game.JobId))
+        queueResume()
+        task.spawn(function()
+            while true do
+                pcall(function() TeleportService:Teleport(game.PlaceId, LocalPlayer) end)
+                task.wait(8)
+            end
+        end)
     end)
-end)
+    -- re-running the script starts a new run; let go of this one's listener right away, otherwise it
+    -- would keep this whole old run alive in memory until some error message happened to show up
+    task.spawn(function()
+        while getgenv().VaultSessionToken == sessionToken do task.wait(5) end
+        errorPromptConn:Disconnect()
+    end)
 
-local function checkOpps()
-    for _, p in ipairs(Players:GetPlayers()) do
-        if p ~= LocalPlayer then
-            local str = p.Name .. (p.DisplayName or "")
-            for i = 1, #str do
-                if string.byte(str, i) > 127 then return true end
+    -- staff: anyone ranked above Member in Da Hood Entertainment, or in Da Hood Stars / Da Hood Verified
+    local STAFF_GROUP = 4698921
+    local FLAGGED_GROUPS = {8068202, 10604500}
+    local function isStaff(player)
+        local ok, role = pcall(function() return player:GetRoleInGroup(STAFF_GROUP) end)
+        if ok and role ~= "Guest" and role ~= "Member" then return true end
+        for _, id in ipairs(FLAGGED_GROUPS) do
+            local okIn, inGroup = pcall(function() return player:IsInGroup(id) end)
+            if okIn and inGroup then return true end
+        end
+        return false
+    end
+
+    -- group lookups are web calls, so each player is checked once (on join, or at start for those
+    -- already here) and the answer kept until they leave
+    local staffHere = {}
+    local function checkPlayer(player)
+        if player == LocalPlayer then return end
+        if isStaff(player) and player.Parent then staffHere[player] = true end
+    end
+    for _, p in ipairs(Players:GetPlayers()) do task.spawn(checkPlayer, p) end
+    local addedConn = Players.PlayerAdded:Connect(function(p) task.spawn(checkPlayer, p) end)
+    local removingConn = Players.PlayerRemoving:Connect(function(p) staffHere[p] = nil end)
+
+    task.spawn(function()
+        while running() and task.wait(2) do
+            local staff = next(staffHere)
+            if staff and getgenv().StaffDetector ~= false and not getgenv().IsHopping then
+                ServerHopLogic("Staff in server: " .. staff.Name)
             end
         end
-    end
-    return false
+        addedConn:Disconnect()
+        removingConn:Disconnect()
+    end)
 end
 
-task.spawn(function()
-    while running() and task.wait(2) do
-        if getgenv().StaffDetector ~= false and checkOpps() and not getgenv().IsHopping then
-            ServerHopLogic("Staff detected, hopping.")
-        end
-    end
-end)
-
 local startCFrame = nil
-local initialCharacter = LocalPlayer and LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
-local initialRoot = initialCharacter and (initialCharacter:FindFirstChild("HumanoidRootPart") or initialCharacter:WaitForChild("HumanoidRootPart", 5))
-if initialRoot then startCFrame = initialRoot.CFrame end
+do
+    local initialCharacter = LocalPlayer and LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
+    local initialRoot = initialCharacter and (initialCharacter:FindFirstChild("HumanoidRootPart") or initialCharacter:WaitForChild("HumanoidRootPart", 5))
+    if initialRoot then startCFrame = initialRoot.CFrame end
+end
 
 local UISConn
 local noclipConn
@@ -1656,14 +1824,19 @@ local hasReset = false
 local function UnloadEverything()
     if not running() then return end
     shared.VaultFarm = false
+    getgenv().VaultAimPosition = nil
+    -- let go of the drum gun's trigger in case it was held mid-shot
+    pcall(function() getTool("Drum-Shotgun"):Deactivate() end)
     saveHistory()
     getgenv().FarmPaused = false
     getgenv().IsHopping = false 
     
     pcall(function()
         if writefile then
+            -- the cache stays: another account may still need it after its next hop. "stopped" in this
+            -- account's heartbeat file is what keeps the hop resume and the autoexec from restarting it.
             writefile("DHC_Cache.lua", "")
-            writefile("Vault_Cache.lua", "")
+            writefile("VaultFarm_Heartbeat_" .. LocalPlayer.Name .. ".txt", "stopped")
         end
     end)
     
@@ -1680,7 +1853,15 @@ local function UnloadEverything()
     
     LocalPlayer.CameraMode = Enum.CameraMode.Classic
     lockedTargetCFrame = nil
+    pcall(function()
+        local c = LocalPlayer.Character
+        local animate = c and c:FindFirstChild("Animate")
+        if animate then animate.Enabled = true end
+        local h = c and c:FindFirstChildOfClass("Humanoid")
+        if h then h.AutoRotate = true end
+    end)
     pcall(function() RunService:Set3dRenderingEnabled(true) end)
+    applyLowMemory(false)
     if setfpscap and (tonumber(getgenv().FPSCap) or 0) > 0 then pcall(setfpscap, 60) end
     
     task.spawn(function()
@@ -1762,44 +1943,81 @@ noclipConn = RunService.Stepped:Connect(function()
     local lp = Players.LocalPlayer
     local char = lp and lp.Character
     if char then
-        for _, v in ipairs(char:GetChildren()) do
-            if v:IsA("BasePart") and v.CanCollide and v.Name ~= "AutoFarmPlatform" then
+        -- no collisions on any part, accessories included
+        for _, v in ipairs(char:GetDescendants()) do
+            if v:IsA("BasePart") and v.CanCollide then
                 v.CanCollide = false
+            end
+        end
+        -- no animations and no auto-turning: the body stays frozen, so the hand (and the gun's grip
+        -- that hangs off it) never shifts and the gun stays put in the middle of the vault
+        local animate = char:FindFirstChild("Animate")
+        if animate and animate.Enabled then animate.Enabled = false end
+        local hum = char:FindFirstChildOfClass("Humanoid")
+        if hum then
+            if hum.AutoRotate then hum.AutoRotate = false end
+            local animator = hum:FindFirstChildOfClass("Animator")
+            if animator then
+                for _, track in ipairs(animator:GetPlayingAnimationTracks()) do track:Stop(0) end
             end
         end
     end
 end)
 
-local stuckTick = 0
-local lastStuckPos = Vector3.zero
+-- outline on our own character, so it's easy to spot even under the floor
+-- (a respawn destroys the old character and the highlight inside it, so each character gets a new one)
 task.spawn(function()
+    local highlight
     while running() do
-        task.wait(1)
-        if getgenv().FarmPaused or getgenv().IsHopping then 
-            stuckTick = 0 
-            continue 
+        local char = LocalPlayer.Character
+        if char and not (highlight and highlight.Parent == char) then
+            if highlight then highlight:Destroy() end
+            highlight = Instance.new("Highlight")
+            highlight.Name = "VaultFarmHighlight"
+            highlight.FillColor = Theme.Accent
+            highlight.FillTransparency = 0.6
+            highlight.OutlineColor = Theme.White
+            highlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+            highlight.Adornee = char
+            highlight.Parent = char
         end
-        local lp = Players.LocalPlayer
-        local char = lp and lp.Character
-        local hrp = char and char:FindFirstChild("HumanoidRootPart")
-        if hrp then
-            if (hrp.Position - lastStuckPos).Magnitude < 1 then
-                stuckTick = stuckTick + 1
-                if stuckTick >= 40 then
-                    task.spawn(function()
-                        ServerHopLogic("Stuck for 40 seconds, hopping...")
-                    end)
+        task.wait(1)
+    end
+    if highlight then highlight:Destroy() end
+end)
+
+do
+    local stuckTick = 0
+    local lastStuckPos = Vector3.zero
+    task.spawn(function()
+        while running() do
+            task.wait(1)
+            if getgenv().FarmPaused or getgenv().IsHopping then 
+                stuckTick = 0 
+                continue 
+            end
+            local lp = Players.LocalPlayer
+            local char = lp and lp.Character
+            local hrp = char and char:FindFirstChild("HumanoidRootPart")
+            if hrp then
+                if (hrp.Position - lastStuckPos).Magnitude < 1 then
+                    stuckTick = stuckTick + 1
+                    if stuckTick >= 40 then
+                        task.spawn(function()
+                            ServerHopLogic("Stuck for 40 seconds, hopping...")
+                        end)
+                        stuckTick = 0
+                    end
+                else
+                    lastStuckPos = hrp.Position
                     stuckTick = 0
                 end
             else
-                lastStuckPos = hrp.Position
                 stuckTick = 0
             end
-        else
-            stuckTick = 0
         end
-    end
-end)
+    end)
+end
 
 antiStompConn = RunService.Heartbeat:Connect(function()
     if not running() then
@@ -1841,12 +2059,12 @@ antiStompConn = RunService.Heartbeat:Connect(function()
             end
         end
         
+        -- finish off this same character only: by the time this runs we've often respawned already, and
+        -- looking up lp.Character here would kill the fresh one, which then repeats on every respawn
         task.delay(4, function()
-            local c2 = lp.Character
-            if c2 then
-                local h2 = c2:FindFirstChild("Head")
-                if h2 then pcall(function() h2:Destroy() end) end
-            end
+            if lp.Character ~= Character2 then return end
+            local h2 = Character2:FindFirstChild("Head")
+            if h2 then pcall(function() h2:Destroy() end) end
         end)
     end
 end)
@@ -1867,121 +2085,132 @@ antiSeatConn = RunService.Heartbeat:Connect(function()
     end
 end)
 
-local animBlockConn, animBlockAnimator
-local function setupAnimationBlocker(char)
-    local humanoid = char and char:FindFirstChildOfClass("Humanoid")
-    if not humanoid then return end
-    local animator = humanoid:FindFirstChildOfClass("Animator") or humanoid
-    if not animator then return end
-    if animBlockAnimator ~= animator then
-        if animBlockConn then animBlockConn:Disconnect() end
-        animBlockAnimator = animator
-        animBlockConn = animator.AnimationPlayed:Connect(function(track)
-            if not running() then
-                animBlockConn:Disconnect()
-                return
-            end
+do
+    local animBlockConn, animBlockAnimator
+    local function setupAnimationBlocker(char)
+        local humanoid = char and char:FindFirstChildOfClass("Humanoid")
+        if not humanoid then return end
+        local animator = humanoid:FindFirstChildOfClass("Animator") or humanoid
+        if not animator then return end
+        if animBlockAnimator ~= animator then
+            if animBlockConn then animBlockConn:Disconnect() end
+            animBlockAnimator = animator
+            animBlockConn = animator.AnimationPlayed:Connect(function(track)
+                if not running() then
+                    animBlockConn:Disconnect()
+                    return
+                end
+                local n = string.lower(track.Name or "")
+                local id = tostring(track.Animation and track.Animation.AnimationId or "")
+                if string.find(n, "block") or string.find(n, "guard") or string.find(id, "10479335397") or string.find(id, "10480396650") then
+                    pcall(function()
+                        track:Stop(0)
+                        track:Destroy()
+                    end)
+                end
+            end)
+        end
+        for _, track in ipairs(animator:GetPlayingAnimationTracks()) do
             local n = string.lower(track.Name or "")
             local id = tostring(track.Animation and track.Animation.AnimationId or "")
-            if string.find(n, "block") or string.find(n, "guard") or string.find(id, "10479335397") or string.find(id, "10480396650") then
+            if string.find(n, "block") or string.find(n, "guard") or string.find(id, "10479335397") or string.find(id, "10480396650") then 
                 pcall(function()
                     track:Stop(0)
                     track:Destroy()
                 end)
             end
-        end)
-    end
-    for _, track in ipairs(animator:GetPlayingAnimationTracks()) do
-        local n = string.lower(track.Name or "")
-        local id = tostring(track.Animation and track.Animation.AnimationId or "")
-        if string.find(n, "block") or string.find(n, "guard") or string.find(id, "10479335397") or string.find(id, "10480396650") then 
-            pcall(function()
-                track:Stop(0)
-                track:Destroy()
-            end)
         end
     end
-end
 
-task.spawn(function()
-    while running() do
-        if not getgenv().FarmPaused then
-            task.wait(2)
-            pcall(function()
-                local lp = Players.LocalPlayer
-                local char = lp and lp.Character
-                if char then
-                    setupAnimationBlocker(char)
-                    for _, v in ipairs(char:GetChildren()) do
-                        if v:IsA("LocalScript") and string.find(string.lower(v.Name), "anticheat") then
-                            v.Disabled = true 
-                            v:Destroy() 
+    task.spawn(function()
+        while running() do
+            if not getgenv().FarmPaused then
+                task.wait(2)
+                pcall(function()
+                    local lp = Players.LocalPlayer
+                    local char = lp and lp.Character
+                    if char then
+                        setupAnimationBlocker(char)
+                        for _, v in ipairs(char:GetChildren()) do
+                            if v:IsA("LocalScript") and string.find(string.lower(v.Name), "anticheat") then
+                                v.Disabled = true 
+                                v:Destroy() 
+                            end
+                        end
+                    end
+                end)
+            else
+                task.wait(0.5)
+            end
+        end
+    end)
+
+    local function setupForceReset(char)
+        if not char then return end
+        setupAnimationBlocker(char)
+        local humanoid = char:WaitForChild("Humanoid", 5)
+        if not humanoid then return end
+        if humanoid.Health <= 1 then return end
+        if forceResetConn then pcall(function() forceResetConn:Disconnect() end) end
+        forceResetConn = humanoid.HealthChanged:Connect(function(health)
+            if not running() then return end
+            if getgenv().FarmPaused then return end
+            if health <= 1 and health > 0 then
+                lockedTargetCFrame = nil
+                local head = char:FindFirstChild("Head")
+                local bgui = nil
+                if head then 
+                    bgui = head:FindFirstChildWhichIsA("BillboardGui")
+                    if bgui then bgui = bgui:Clone() end
+                    head:Destroy() 
+                else 
+                    humanoid.Health = 0 
+                end
+            
+                local partsToSpoof = {"UpperTorso", "Head", "HumanoidRootPart", "LowerTorso", "Torso"}
+                for _, pName in ipairs(partsToSpoof) do
+                    if not char:FindFirstChild(pName) then
+                        local p = Instance.new("Part")
+                        p.Name = pName
+                        p.Transparency = 1
+                        p.Parent = char
+                        if pName == "Head" and bgui then
+                            bgui.Parent = p
                         end
                     end
                 end
-            end)
-        else
-            task.wait(0.5)
-        end
+            
+                if forceResetConn then forceResetConn:Disconnect() end
+            end
+        end)
     end
-end)
 
-local function setupForceReset(char)
-    if not char then return end
-    setupAnimationBlocker(char)
-    local humanoid = char:WaitForChild("Humanoid", 5)
-    if not humanoid then return end
-    if humanoid.Health <= 1 then return end
-    if forceResetConn then pcall(function() forceResetConn:Disconnect() end) end
-    forceResetConn = humanoid.HealthChanged:Connect(function(health)
-        if not running() then return end
-        if getgenv().FarmPaused then return end
-        if health <= 1 and health > 0 then
-            lockedTargetCFrame = nil
-            local head = char:FindFirstChild("Head")
-            local bgui = nil
-            if head then 
-                bgui = head:FindFirstChildWhichIsA("BillboardGui")
-                if bgui then bgui = bgui:Clone() end
-                head:Destroy() 
-            else 
-                humanoid.Health = 0 
-            end
-            
-            local partsToSpoof = {"UpperTorso", "Head", "HumanoidRootPart", "LowerTorso", "Torso"}
-            for _, pName in ipairs(partsToSpoof) do
-                if not char:FindFirstChild(pName) then
-                    local p = Instance.new("Part")
-                    p.Name = pName
-                    p.Transparency = 1
-                    p.Parent = char
-                    if pName == "Head" and bgui then
-                        bgui.Parent = p
-                    end
-                end
-            end
-            
-            if forceResetConn then forceResetConn:Disconnect() end
+    local charAddedConn
+    charAddedConn = LocalPlayer.CharacterAdded:Connect(function(char)
+        if not running() then
+            charAddedConn:Disconnect()
+            return
         end
+        currentSpawnSetup = false
+        lockedTargetCFrame = nil
+        hasReset = false
+        setupForceReset(char)
+        setupAnimationBlocker(char)
     end)
-end
 
-local charAddedConn
-charAddedConn = LocalPlayer.CharacterAdded:Connect(function(char)
-    if not running() then
-        charAddedConn:Disconnect()
-        return
+    if LocalPlayer.Character then
+        setupForceReset(LocalPlayer.Character)
+        setupAnimationBlocker(LocalPlayer.Character)
     end
-    currentSpawnSetup = false
-    lockedTargetCFrame = nil
-    hasReset = false
-    setupForceReset(char)
-    setupAnimationBlocker(char)
-end)
 
-if LocalPlayer.Character then
-    setupForceReset(LocalPlayer.Character)
-    setupAnimationBlocker(LocalPlayer.Character)
+    -- these character listeners only let go on their own at the next respawn or animation; when the
+    -- script is re-run, drop them as soon as the new run takes over so the old run can be freed
+    task.spawn(function()
+        while getgenv().VaultSessionToken == sessionToken do task.wait(5) end
+        charAddedConn:Disconnect()
+        if forceResetConn then forceResetConn:Disconnect() end
+        if animBlockConn then animBlockConn:Disconnect() end
+    end)
 end
 
 task.spawn(function()
@@ -2041,6 +2270,33 @@ local function BuyItem(itemName, isAmmo, clicks)
     return true
 end
 
+-- Drum-Shotgun ammo is only bought once the total we carry drops below this
+local DRUM_AMMO_MIN = 100
+-- before the door blows, the clip (the bullets loaded to shoot, the gun's Ammo value) is topped up
+-- whenever it holds fewer than this, so the shooting doesn't stop for a reload halfway through
+local CLIP_RELOAD_BELOW = 20
+
+-- equipping a gun makes the game show its ammo in MainScreenGui.AmmoFrame.AmmoText ("clip / total"
+-- style); the last number there is everything we carry. nil when it can't be read.
+local function readTotalAmmo(tool)
+    local char = LocalPlayer.Character
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    if not hum then return nil end
+    local wasEquipped = tool.Parent == char
+    if not wasEquipped then
+        pcall(function() hum:EquipTool(tool) end)
+        task.wait(0.3)
+    end
+    local total
+    pcall(function()
+        local text = LocalPlayer.PlayerGui.MainScreenGui.AmmoFrame.AmmoText.Text
+        text = string.gsub(text, "[,%.]", "")
+        for n in string.gmatch(text, "%d+") do total = tonumber(n) end
+    end)
+    if not wasEquipped then pcall(function() hum:UnequipTools() end) end
+    return total
+end
+
 local function BuyFullLoadout()
     if not running() or isDead() then return false end
     if not getTool("Grenade") then
@@ -2054,17 +2310,128 @@ local function BuyFullLoadout()
     end
     if not running() or isDead() then return false end
     
+    -- the on-screen counter shows every bullet we carry, so only buy once that runs low;
+    -- if it can't be read, fall back to the old rule of topping up whenever the clip is under 50
     local ds = getTool("Drum-Shotgun")
-    local currentAmmo = 0
-    if ds then
-        local am = ds:FindFirstChild("Ammo")
-        if am then currentAmmo = am.Value end
+    local needAmmo
+    local totalAmmo = ds and readTotalAmmo(ds)
+    if totalAmmo then
+        needAmmo = totalAmmo < DRUM_AMMO_MIN
+    else
+        local am = ds and ds:FindFirstChild("Ammo")
+        needAmmo = not am or am.Value < 50
     end
-    
-    if currentAmmo < 50 then
+
+    if needAmmo then
         setStatus("Buying [Drum-Shotgun Ammo]")
         if not BuyItem("Drum-Shotgun Ammo", true, 7) then return false end
     end
+    return true
+end
+
+-- after a reload is sent: waits until the gun's Ammo is back up to its MaxAmmo, which is when it can
+-- shoot again. Gives up after 4 seconds (lag, or not enough bullets left to fill the clip)
+local function waitReloaded(gun)
+    local ammo, maxAmmo = gun:FindFirstChild("Ammo"), gun:FindFirstChild("MaxAmmo")
+    if not (ammo and maxAmmo) then
+        task.wait(1.5)
+        return
+    end
+    local start = tick()
+    while ammo.Value < maxAmmo.Value and tick() - start < 4 and running() and not isDead() do
+        task.wait(0.05)
+    end
+end
+
+-- the Drum-Shotgun's clip comes back empty after every server hop, or runs low from the last server;
+-- reloading while we'd be waiting anyway (the grenade's fuse) means it's full the moment the door
+-- opens. True if a reload started.
+local function reloadDrumgun()
+    local ds = getTool("Drum-Shotgun")
+    local hum = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
+    local ammo = ds and ds:FindFirstChild("Ammo")
+    if not (hum and ammo) or ammo.Value >= CLIP_RELOAD_BELOW then return false end
+    setStatus("Reloading [Drum-Shotgun]")
+    pcall(function() hum:EquipTool(ds) end)
+    -- the reload goes out a moment after equipping, without holding up the caller
+    task.delay(0.15, function()
+        local mainEvent = game:GetService("ReplicatedStorage"):FindFirstChild("MainEvent")
+        if mainEvent and ds.Parent == LocalPlayer.Character then mainEvent:FireServer("Reload", ds) end
+    end)
+    return true
+end
+
+-- how far below the floor we stand while picking up cash and while waiting for more to drop (menu setting)
+local function cashDepth()
+    return math.clamp(tonumber(getgenv().CashDepth) or 6, 1, 15)
+end
+
+-- the vault (its center point) whose cash is being picked up. We stay on it until all of its cash is
+-- gone and only then move to the next vault: jumping back and forth between vaults while they break
+-- is slower, and some pickups don't register when we keep teleporting away
+local cashFocus
+
+-- picks up one cash drop lying within 15 studs of one of the given points (vault centers): the one
+-- nearest to us around the vault we're already on, or around the next vault once that one is empty.
+-- Returns false when there's nothing to pick up
+local function pickUpCash(centers)
+    local hrp = Players.LocalPlayer.Character and Players.LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+    local dropFolder = workspace:FindFirstChild("Ignored") and workspace.Ignored:FindFirstChild("Drop")
+    if not (hrp and dropFolder) then return false end
+
+    -- every drop belongs to the vault it lies closest to
+    local byCenter = {}
+    for _, drop in ipairs(dropFolder:GetChildren()) do
+        if drop.Name == "MoneyDrop" or string.find(string.lower(drop.Name), "money") or string.find(string.lower(drop.Name), "cash") then
+            local part = drop:IsA("BasePart") and drop or drop:FindFirstChildWhichIsA("BasePart", true)
+            if part then
+                local best, bestDist = nil, 15
+                for i, center in ipairs(centers) do
+                    local dist = (part.Position - center).Magnitude
+                    if dist <= bestDist then best, bestDist = i, dist end
+                end
+                if best then
+                    byCenter[best] = byCenter[best] or {}
+                    table.insert(byCenter[best], {drop, part})
+                end
+            end
+        end
+    end
+
+    -- stay on the current vault while it still has cash; otherwise switch to the vault whose cash is nearest
+    local group
+    for i, center in ipairs(centers) do
+        if center == cashFocus then group = byCenter[i] end
+    end
+    if not group then
+        cashFocus = nil
+        local nearest = 9e9
+        for i, list in pairs(byCenter) do
+            for _, item in ipairs(list) do
+                local dist = (item[2].Position - hrp.Position).Magnitude
+                if dist < nearest then nearest, cashFocus, group = dist, centers[i], list end
+            end
+        end
+    end
+    if not group then return false end
+
+    local foundCash, cashPart
+    local closestDist = 9e9
+    for _, item in ipairs(group) do
+        local dist = (item[2].Position - hrp.Position).Magnitude
+        if dist < closestDist then closestDist, foundCash, cashPart = dist, item[1], item[2] end
+    end
+
+    -- stand under the floor right below the cash: still close enough to pick it up, but out of sight
+    lastVaultCashOffset = Vector3.new(0, -cashDepth(), 0)
+    securePosition(hrp, cashPart.Position + lastVaultCashOffset, cashPart.Position)
+
+    local cd = foundCash:FindFirstChildWhichIsA("ClickDetector", true)
+    if cd then pcall(function() safeFireClick(cd) end) end
+    pcall(function() safeFireTouch(hrp, cashPart, 0) end)
+    task.wait(0.01)
+    pcall(function() safeFireTouch(hrp, cashPart, 1) end)
+    task.wait(0.05)
     return true
 end
 
@@ -2075,49 +2442,7 @@ local function CollectVaultCash(baseTargetPos)
         if getgenv().FarmPaused then collectStartTime = tick(); task.wait(0.1); continue end
         if (tick() - collectStartTime) > 15 then break end
         if isDead() then return false end
-        
-        local hrp = Players.LocalPlayer.Character and Players.LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
-        if not hrp then return false end
-        
-        local dropFolder = workspace:FindFirstChild("Ignored") and workspace.Ignored:FindFirstChild("Drop")
-        if not dropFolder then return false end
-        local foundCash = nil
-        local closestDist = 9e9
-        
-        for _, drop in ipairs(dropFolder:GetChildren()) do
-            if drop.Name == "MoneyDrop" or string.find(string.lower(drop.Name), "money") or string.find(string.lower(drop.Name), "cash") then
-                local cashPart = drop:IsA("BasePart") and drop or drop:FindFirstChildWhichIsA("BasePart", true)
-                if cashPart then
-                    local dist = (cashPart.Position - baseTargetPos).Magnitude
-                    if dist <= 15 and dist < closestDist then
-                        closestDist = dist
-                        foundCash = drop
-                    end
-                end
-            end
-        end
-        
-        if foundCash then
-            local cashPart = foundCash:IsA("BasePart") and foundCash or foundCash:FindFirstChildWhichIsA("BasePart", true)
-            if cashPart then
-                getgenv().VaultCashAngle = (getgenv().VaultCashAngle or 0) + math.rad(math.random(45, 110))
-                local radius = math.random(5, 10)
-                local newOffset = Vector3.new(math.cos(getgenv().VaultCashAngle) * radius, math.random(1, 3), math.sin(getgenv().VaultCashAngle) * radius)
-                lastVaultCashOffset = newOffset
-
-                local targetPos = cashPart.Position + lastVaultCashOffset
-                securePosition(hrp, targetPos, cashPart.Position)
-                
-                local cd = foundCash:FindFirstChildWhichIsA("ClickDetector", true)
-                if cd then pcall(function() safeFireClick(cd) end) end
-                pcall(function() safeFireTouch(hrp, cashPart, 0) end)
-                task.wait(0.01)
-                pcall(function() safeFireTouch(hrp, cashPart, 1) end)
-                task.wait(0.15)
-            end
-        else
-            if (tick() - collectStartTime) > 1.5 then break end
-        end
+        if not pickUpCash({baseTargetPos}) and (tick() - collectStartTime) > 1.5 then break end
         task.wait()
     end
     return true
@@ -2129,6 +2454,348 @@ task.spawn(function()
         SendWebhook("Started Farm", 0)
     end
 end)
+
+-- Grenade TP: throw the grenade from a safe spot, then move it onto the vault door instead of aiming
+-- the throw. It hovers above the door first (it needs a moment before moving it sticks), then sits
+-- on the door until its fuse goes off.
+local GRENADE_HOVER_HEIGHT, GRENADE_HOVER_SECONDS = 5, 1.25
+local GRENADE_THROW_POS = Vector3.new(-659, -31, -289)
+-- where the bullet TP parks the gun: the middle of the vault room, with a clear shot at all four safes
+local GUN_SPOT = Vector3.new(-659, -31, -286)
+-- the gun never goes further than this from us (menu setting): with the default gun shots past 15 studs
+-- don't register, some skins reach further
+local function gunReach()
+    return math.clamp(tonumber(getgenv().GunReach) or 15, 5, 30)
+end
+-- while the vaults are being robbed the camera watches the room from an invisible part placed here
+local CAMERA_SPOT = GUN_SPOT + Vector3.new(0, 3, 0)
+
+-- the vault door, or nil while it's blown open. It grows back after a while, and while it stands
+-- the vaults take no damage, so every shooting loop keeps checking for it
+local function getVaultDoor()
+    local map = workspace:FindFirstChild("MAP")
+    map = map and map:FindFirstChild("Map")
+    local vault = map and map:FindFirstChild("Vault")
+    return vault and vault:FindFirstChild("VaultPart")
+end
+
+local function blowDoorWithGrenadeTP(char, hrp, door)
+    local tool = getTool("Grenade")
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    if not (tool and hum and hrp) then return end
+
+    -- thrown from inside the vault, behind the door: the grenade is steered onto the door anyway,
+    -- and this way we're already standing by the vaults when it blows
+    local vaultCenter = door.Position
+    securePosition(hrp, GRENADE_THROW_POS, vaultCenter)
+
+    setStatus("Throwing Grenade")
+    hum:EquipTool(tool)
+    task.wait(0.3)
+
+    -- only a grenade that appears after our throw is ours; anything already in Ignored is someone else's
+    local ignored = workspace:FindFirstChild("Ignored")
+    local before = {}
+    if ignored then
+        for _, obj in ipairs(ignored:GetChildren()) do before[obj] = true end
+    end
+    pressTool(tool)
+    -- pressed a second time if the first didn't throw it, as the throw has always been done
+    task.wait(0.5)
+    if tool.Parent == char then pressTool(tool) end
+
+    local grenade
+    local waitStart = tick()
+    while ignored and not grenade and tick() - waitStart < 2 do
+        for _, obj in ipairs(ignored:GetChildren()) do
+            if not before[obj] and obj:IsA("BasePart") and obj.Name == "Handle" then
+                grenade = obj
+                break
+            end
+        end
+        if not grenade then RunService.Heartbeat:Wait() end
+    end
+    if not grenade then
+        notify("Grenade", "Nothing showed up in Ignored to guide", Theme.Gold)
+        pcall(function() hum:UnequipTools() end)
+        return
+    end
+
+    -- a thrown grenade no longer needs its tool, so swap to the drum gun and reload during the fuse
+    local reloading = reloadDrumgun()
+    setStatus("Guiding Grenade onto the door")
+    local flyStart = tick()
+    while grenade.Parent and tick() - flyStart < 8 do
+        local offset = tick() - flyStart < GRENADE_HOVER_SECONDS and GRENADE_HOVER_HEIGHT or 0
+        pcall(function() grenade.CFrame = CFrame.new(vaultCenter + Vector3.new(0, offset, 0)) end)
+        RunService.Heartbeat:Wait()
+    end
+    -- the drum gun stays in hand when it's reloading; the shooting comes next anyway
+    if not reloading then pcall(function() hum:UnequipTools() end) end
+
+    local doorWait = tick()
+    while door.Parent and tick() - doorWait < 2 do task.wait(0.1) end
+end
+
+-- Silent aim at the vaults: the game's GunHandler builds every shot from data.AimPosition, so while
+-- getgenv().VaultAimPosition is set, our own shots (never anyone else's) go to that point instead.
+-- Needs an executor whose require() can load the game's modules, and a GunHandler table it can write
+-- to (unfrozen, or setreadonly to unlock it); returns false when that's not the case.
+local function hookGunHandler()
+    local hooked = false
+    pcall(function()
+        if type(require) ~= "function" then return end
+        local modules = game:GetService("ReplicatedStorage"):WaitForChild("Modules", 10)
+        local module = modules and modules:WaitForChild("GunHandler", 10)
+        local GunHandler = module and require(module)
+        if type(GunHandler) ~= "table" or type(GunHandler.shoot) ~= "function" then return end
+        if table.isfrozen and table.isfrozen(GunHandler) then
+            if type(setreadonly) ~= "function" then return end
+            setreadonly(GunHandler, false)
+        end
+        -- always wrap the game's own function, so re-running the script doesn't stack wrappers
+        local original = getgenv().VaultOriginalShoot or GunHandler.shoot
+        getgenv().VaultOriginalShoot = original
+        local wrapper
+        wrapper = function(data)
+            local aim = getgenv().VaultAimPosition
+            if aim and type(data) == "table" and data.Shooter == Players.LocalPlayer.Character then
+                data.AimPosition = aim
+                -- no spread: zero any spread value the shot carries, so every pellet goes at the aim point
+                for key, value in pairs(data) do
+                    if type(value) == "number" and string.find(string.lower(tostring(key)), "spread", 1, true) then
+                        data[key] = 0
+                    end
+                end
+            end
+            return original(data)
+        end
+        GunHandler.shoot = wrapper
+        -- some executors fail the write silently, so check it actually took
+        hooked = GunHandler.shoot == wrapper
+    end)
+    return hooked
+end
+
+-- what this executor supports, checked once at start. A newer method only runs when everything it
+-- relies on is there; otherwise that step uses the older method. Bullet TP and no spread ride on the
+-- silent aim hook, so they need it too. The grenade TP only moves a part, which every executor can do.
+local support = {silentAim = hookGunHandler()}
+support.bulletTP = support.silentAim
+do
+    local executorName = "This executor"
+    pcall(function()
+        if identifyexecutor then executorName = tostring((identifyexecutor())) end
+    end)
+    local missing = {}
+    if not support.silentAim then table.insert(missing, "require/module hook (silent aim, bullet TP, no spread: using the normal shooting)") end
+    if not firetouchinterest then table.insert(missing, "firetouchinterest (cash pickup)") end
+    if not (fireclickdetector or firesignal) then table.insert(missing, "fireclickdetector (shops)") end
+    if not (queue_on_teleport or queueonteleport or (syn and syn.queue_on_teleport)) then table.insert(missing, "queue_on_teleport (farm won't restart after a hop)") end
+    if not (request or http_request or (syn and syn.request)) then table.insert(missing, "request (server hop)") end
+    if not (writefile and readfile) then table.insert(missing, "writefile/readfile (nothing gets saved)") end
+    if #missing == 0 then
+        notify("Executor", executorName .. " supports everything", Theme.Green)
+    else
+        warn("[Vault Farm] " .. executorName .. " is missing: " .. table.concat(missing, "; "))
+        notify("Executor", executorName .. " lacks " .. #missing .. " feature(s), details in F9", Theme.Gold)
+    end
+end
+
+local function aliveVaults()
+    local list = {}
+    local cashiers = workspace:FindFirstChild("Cashiers")
+    if not cashiers then return list end
+    for _, v in ipairs(cashiers:GetChildren()) do
+        if string.find(string.upper(v.Name), "VAULT") then
+            local hum = v:FindFirstChildOfClass("Humanoid")
+            local head = v:FindFirstChild("Head") or v:FindFirstChild("Part")
+            if hum and hum.Health > 0 and head then table.insert(list, {hum = hum, head = head}) end
+        end
+    end
+    return list
+end
+
+-- A shooter thread breaks the vaults one after another with silent aim while this thread picks up
+-- the cash as it drops. A vault whose health stops going down (shots blocked) is skipped and left
+-- for the regular per-vault pass that runs afterwards.
+local function shootVaultsWhileCollecting()
+    local ds = getTool("Drum-Shotgun")
+    local hum = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
+    if not (ds and hum) then return end
+    local centers = {}
+    for _, t in ipairs(aliveVaults()) do table.insert(centers, t.head.Position) end
+    if #centers == 0 then return end
+
+    -- Bullet TP: the gun sits in the middle of the vault room and silent aim sends each bullet from
+    -- there to the vault being shot. Every frame the hand-to-gun weld (RightGrip) is re-aimed at the
+    -- room center, so wherever we move to pick up cash the gun never leaves it, and since the tool is
+    -- never re-equipped the held trigger is never dropped. The weld is put back when the phase ends.
+    -- Shots fired from more than 15 studs away from us don't count, so when picking up cash takes us
+    -- further than that from the room center, the gun slides toward us along the line between the two
+    -- and stays at the menu's gun reach; it goes back to the center as soon as we're close again.
+    local bulletTP = getgenv().BulletTPVaults ~= false and support.bulletTP
+    local roomCenter = GUN_SPOT
+    local gripConn
+    if bulletTP then
+        gripConn = RunService.Heartbeat:Connect(function()
+            -- also lets go on its own if the farm stops or errors out mid-phase
+            if not running() or not ds.Parent then
+                gripConn:Disconnect()
+                return
+            end
+            local char = LocalPlayer.Character
+            local hand = char and char:FindFirstChild("RightHand")
+            local weld = hand and hand:FindFirstChild("RightGrip")
+            local root = char and char:FindFirstChild("HumanoidRootPart")
+            if weld and root and ds.Parent == char then
+                local spot = roomCenter
+                local away = roomCenter - root.Position
+                local reach = gunReach()
+                if away.Magnitude > reach then
+                    spot = root.Position + away.Unit * reach
+                end
+                local target = CFrame.new(spot)
+                -- Handle = hand * C0 * C1:Inverse(), solved for the C1 that puts Handle on target
+                weld.C1 = target:Inverse() * hand.CFrame * weld.C0
+            end
+        end)
+    end
+
+    -- we're hidden under the floor, so the camera watches the vault room from a fixed invisible part
+    -- in its middle instead (it can still be turned and zoomed around it)
+    local camPart = Instance.new("Part")
+    camPart.Name = "VaultFarmCamera"
+    camPart.Size = Vector3.new(1, 1, 1)
+    camPart.Transparency = 1
+    camPart.Anchored = true
+    camPart.CanCollide, camPart.CanQuery, camPart.CanTouch = false, false, false
+    camPart.CFrame = CFrame.new(CAMERA_SPOT)
+    camPart.Parent = workspace
+    pcall(function() workspace.CurrentCamera.CameraSubject = camPart end)
+
+    setStatus("Shooting vaults, picking up cash")
+    local phase = {shooting = true, active = true}
+    task.spawn(function()
+        local skipped = {}
+        local current, lastHealth, lastHit
+        -- the trigger: the Drum-Shotgun's own script starts firing on Tool.Activated and keeps going, at
+        -- its own cooldown, until Tool.Deactivated, the same as holding the mouse down. So ds:Activate()
+        -- once is a held trigger and ds:Deactivate() lets go; every shot is the game's own ("Shoot",
+        -- GunHandler.shoot per pellet, MainEvent "ShootGun"). No mouse, camera or screen center involved.
+        -- It's only let go to reload, re-equip or pause, or to press again if the gun stopped firing.
+        local holding = false
+        local lastAmmo, lastAmmoChange = nil, tick()
+        local function release()
+            if holding then
+                pcall(function() ds:Deactivate() end)
+                holding = false
+            end
+        end
+        while phase.active and running() and not isDead() and not getgenv().IsHopping do
+            if getgenv().FarmPaused then
+                release()
+                lastHit = tick()
+                task.wait(0.1)
+                continue
+            end
+            if getVaultDoor() then
+                -- the door grew back: shots do nothing until it's blown again
+                phase.doorBack = true
+                break
+            end
+            local target
+            local alive = aliveVaults()
+            for _, t in ipairs(alive) do
+                if not skipped[t.hum] then
+                    target = t
+                    break
+                end
+            end
+            if not target then
+                if #alive == 0 then break end
+                -- every vault still standing got skipped once (a reload, the gun being re-placed):
+                -- give them all another go instead of handing them to the old method
+                skipped, current = {}, nil
+                task.wait(0.1)
+                continue
+            end
+            if target.hum ~= current then
+                current, lastHealth, lastHit = target.hum, target.hum.Health, tick()
+            elseif target.hum.Health < lastHealth then
+                lastHealth, lastHit = target.hum.Health, tick()
+            elseif tick() - lastHit > 4 then
+                skipped[target.hum] = true
+                continue
+            end
+            if ds.Parent ~= LocalPlayer.Character then
+                release()
+                pcall(function() hum:EquipTool(ds) end)
+                task.wait(0.2)
+            end
+            -- silent aim switches targets on its own, so the trigger doesn't need letting go for that
+            getgenv().VaultAimPosition = target.head.Position
+            local ammo = ds:FindFirstChild("Ammo")
+            if ammo and ammo.Value <= 0 then
+                release()
+                local mainEvent = game:GetService("ReplicatedStorage"):FindFirstChild("MainEvent")
+                if mainEvent then mainEvent:FireServer("Reload", ds) end
+                waitReloaded(ds)
+                lastHit = tick()
+            else
+                -- the gun's loop ends by itself when it can't shoot for a moment (getCanShoot); if the clip
+                -- hasn't moved in a while, let go and press again, like a player re-clicking
+                if ammo and ammo.Value ~= lastAmmo then
+                    lastAmmo, lastAmmoChange = ammo.Value, tick()
+                elseif holding and tick() - lastAmmoChange > 0.75 then
+                    release()
+                end
+                if not holding then
+                    pcall(function() ds:Activate() end)
+                    holding = true
+                    lastAmmoChange = tick()
+                end
+                task.wait(0.05)
+            end
+        end
+        release()
+        getgenv().VaultAimPosition = nil
+        phase.shooting = false
+    end)
+
+    -- cash keeps dropping while vaults break, so collect until the shooting is over and nothing is left
+    -- run protected: if anything in here errors, the shooter thread, the grip and the camera part still
+    -- get cleaned up below, instead of a held trigger and a stray thread carrying on into the next round
+    local ok, err = pcall(function()
+        local started, lastCash = tick(), tick()
+        while running() and not isDead() and not getgenv().IsHopping and tick() - started < 60 do
+            if getgenv().FarmPaused then
+                lastCash = tick()
+                task.wait(0.1)
+                continue
+            end
+            if pickUpCash(centers) then
+                lastCash = tick()
+            elseif not phase.shooting and tick() - lastCash > 1.5 then
+                break
+            else
+                local hrp = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+                securePosition(hrp, GRENADE_THROW_POS - Vector3.new(0, cashDepth(), 0), centers[1])
+                task.wait(0.1)
+            end
+            task.wait()
+        end
+    end)
+    phase.active = false
+    getgenv().VaultAimPosition = nil
+    if gripConn then gripConn:Disconnect() end
+    -- unequipping drops the weld, so the next equip starts from the tool's normal grip
+    pcall(function() hum:UnequipTools() end)
+    pcall(function() workspace.CurrentCamera.CameraSubject = hum end)
+    camPart:Destroy()
+    if not ok then error(err, 0) end
+    return phase.doorBack == true
+end
 
 local function farmStep()
     task.wait()
@@ -2162,7 +2829,6 @@ local function farmStep()
     local char = LocalPlayer.Character
     if char and char:FindFirstChildOfClass("ForceField") then
         setStatus("Waiting for respawnshield to be off")
-        clickCenter(0.05)
         task.wait(0.25)
         return
     end
@@ -2210,7 +2876,7 @@ local function farmStep()
                 task.wait(0.05)
             end
             if maskTool.Parent == char then
-                clickCenter(0.05)
+                pressTool(maskTool)
                 task.wait(0.05)
                 if hum then pcall(function() hum:UnequipTools() end) end
                 task.wait(0.05)
@@ -2229,12 +2895,15 @@ local function farmStep()
     
     if not BuyFullLoadout() then return end
     
-    local MAP = workspace:FindFirstChild("MAP")
-    if MAP then MAP = MAP:FindFirstChild("Map") end
-    if MAP then MAP = MAP:FindFirstChild("Vault") end
-    local v96 = MAP and MAP:FindFirstChild("VaultPart")
+    local v96 = getVaultDoor()
     
-    if v96 and v96.Parent then
+    if v96 and v96.Parent and getgenv().DoorMethod ~= "grenade" then
+        if not getTool("Grenade") then
+            setStatus("Failsafe: Re-buying [Grenade]")
+            BuyItem("Grenade", false, 3)
+        end
+        blowDoorWithGrenadeTP(char, hrp, v96)
+    elseif v96 and v96.Parent then
         local nade = getTool("Grenade")
         if not nade then
             setStatus("Failsafe: Re-buying [Grenade]")
@@ -2289,20 +2958,15 @@ local function farmStep()
             task.wait(0.3)
             
             if not isDead() then
-                pcall(function() nade:Activate() end)
-                clickCenter(0.01)
-
+                pressTool(nade)
                 task.wait(0.5)
-
-                if nade and char == nade.Parent then
-                    pcall(function() nade:Activate() end)
-                    clickCenter(0.01)
-                end
+                if nade and char == nade.Parent then pressTool(nade) end
             end
             
             task.wait(0.5)
             securePosition(hrp, safeBackPos, vaultCenter)
-            
+            reloadDrumgun()
+
             task.wait(4.0)
             
             if lockConn then lockConn:Disconnect() end
@@ -2316,12 +2980,28 @@ local function farmStep()
     if isDead() then return end
     while getgenv().FarmPaused and running() do task.wait(0.1) end
     if not running() then return "stop" end
-    
-    local Cashiers = workspace:FindFirstChild("Cashiers")
+
+    -- with silent aim available the old per-vault pass never runs; any vault left standing just gets
+    -- another silent-aim round
+    local usedSilentAim = getgenv().SilentAimVaults ~= false and support.silentAim
+    if usedSilentAim then
+        for _ = 1, 3 do
+            if #aliveVaults() == 0 then break end
+            -- door up again (it grew back, or the grenade didn't take it): the next pass blows it
+            if getVaultDoor() then return end
+            local doorBack = shootVaultsWhileCollecting()
+            if isDead() then return end
+            if not running() then return "stop" end
+            if doorBack then return end
+        end
+    end
+
+    -- regular pass (only without silent aim): walks up to each vault and shoots it with the camera
+    local Cashiers = not usedSilentAim and workspace:FindFirstChild("Cashiers")
     if Cashiers then
         local brokenVaults = {}
         for _, v in ipairs(Cashiers:GetChildren()) do
-            if isDead() or not running() or getgenv().IsHopping then break end
+            if isDead() or not running() or getgenv().IsHopping or getVaultDoor() then break end
             if not string.find(string.upper(v.Name), "VAULT") then continue end
             local Humanoid2 = v:FindFirstChildOfClass("Humanoid")
             local Head = v:FindFirstChild("Head") or v:FindFirstChild("Part")
@@ -2338,8 +3018,10 @@ local function farmStep()
             LocalPlayer.CameraMode = Enum.CameraMode.LockFirstPerson
             local sideLook = Head.CFrame.RightVector * (math.random() > 0.5 and 5 or -5)
             local breakPos = Head.CFrame * CFrame.new(0, 0, 3.5).Position
-            
-            while Humanoid2 and Humanoid2.Health > 0 and v.Parent and running() and not isDead() and not getgenv().IsHopping and not getgenv().FarmPaused do
+
+            -- trigger held (the gun fires on its own until Deactivate), let go only to reload
+            pcall(function() ds:Activate() end)
+            while Humanoid2 and Humanoid2.Health > 0 and v.Parent and running() and not isDead() and not getgenv().IsHopping and not getgenv().FarmPaused and not getVaultDoor() do
                 local hrp = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
                 securePosition(hrp, breakPos + sideLook, Head.Position)
                 
@@ -2350,16 +3032,19 @@ local function farmStep()
                 
                 local Ammo = ds:FindFirstChild("Ammo")
                 if Ammo and Ammo.Value <= 0 then
+                    pcall(function() ds:Deactivate() end)
                     local MainEvent = game:GetService("ReplicatedStorage"):FindFirstChild("MainEvent")
                     if MainEvent then MainEvent:FireServer("Reload", ds) end
-                    task.wait(1.5)
+                    waitReloaded(ds)
                     if isDead() then break end
                     securePosition(hrp, breakPos + sideLook, Head.Position)
+                    pcall(function() ds:Activate() end)
                 end
-                
-                clickCenter(0.05)
+
+                task.wait(0.05)
             end
-            
+            pcall(function() ds:Deactivate() end)
+
             if isDead() then break end
             table.insert(brokenVaults, Head.Position)
         end
@@ -2395,6 +3080,8 @@ while running() do
     else
         consecutiveErrors = consecutiveErrors + 1
         warn("[Vault Farm] " .. tostring(result))
+        getgenv().VaultAimPosition = nil
+        pcall(function() getTool("Drum-Shotgun"):Deactivate() end)
         if lockConn then pcall(function() lockConn:Disconnect() end) end
         lockedTargetCFrame = nil
         pcall(function()
@@ -2405,6 +3092,8 @@ while running() do
             cam.CameraType = Enum.CameraType.Custom
             local hum = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
             if hum then cam.CameraSubject = hum end
+            local camPart = workspace:FindFirstChild("VaultFarmCamera")
+            if camPart then camPart:Destroy() end
         end)
         if consecutiveErrors == 1 or consecutiveErrors % 5 == 0 then
             notify("Recovered from an error", (string.gsub(tostring(result), "^.-:%d+: ", "")), Theme.Gold)
@@ -2422,11 +3111,27 @@ end
 pcall(function()
     if writefile then
         writefile("DHC_Cache.lua", "")
-        writefile("Vault_Cache.lua", VaultFarmCode)
+        -- the cache is what restarts the farm after a hop or a crash; it carries the webhook along, since
+        -- after a crash nothing else remembers it
+        local header = string.format("if getgenv().Webhook == nil then getgenv().Webhook = %q end\n", tostring(getgenv().Webhook or ""))
+        writefile("Vault_Cache.lua", header .. VaultFarmCode)
     end
 end)
 
-local func = loadstring(VaultFarmCode)
+-- a failure here used to be silent; show it on screen and in the F9 console instead
+local function reportError(msg)
+    warn("[Vault Farm] " .. tostring(msg))
+    pcall(function()
+        game:GetService("StarterGui"):SetCore("SendNotification", {Title = "Vault Farm error", Text = tostring(msg), Duration = 15})
+    end)
+end
+
+local func, compileErr = loadstring(VaultFarmCode)
 if func then
-    task.spawn(func)
+    task.spawn(function()
+        local ok, err = xpcall(func, debug.traceback)
+        if not ok then reportError(err) end
+    end)
+else
+    reportError(compileErr or "loadstring is not available in this executor")
 end
