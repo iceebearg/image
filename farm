@@ -1,15 +1,4 @@
-getgenv().Webhook = ""
-getgenv().StaffDetector = true
-getgenv().UseMask = true
-getgenv().Disable3DRender = false
-getgenv().BlackScreen = false
-getgenv().FPSCap = 0
-getgenv().DoorMethod = "grenade_tp"
-getgenv().SilentAimVaults = true
-getgenv().BulletTPVaults = true
-getgenv().CashDepth = 6
-getgenv().GunReach = 15
-getgenv().LowMemory = true
+
 
 local VaultFarmCode = [====[
 if getgenv().FarmPaused == nil then getgenv().FarmPaused = false end
