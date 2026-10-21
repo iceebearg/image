@@ -1,4 +1,21 @@
-
+-- defaults only: anything the loader set before loading this script is kept
+local defaults = {
+    Webhook = "",
+    StaffDetector = true,
+    UseMask = true,
+    Disable3DRender = false,
+    BlackScreen = false,
+    FPSCap = 0,
+    DoorMethod = "grenade_tp",
+    SilentAimVaults = true,
+    BulletTPVaults = true,
+    CashDepth = 6,
+    GunReach = 15,
+    LowMemory = true,
+}
+for key, value in pairs(defaults) do
+    if getgenv()[key] == nil then getgenv()[key] = value end
+end
 
 local VaultFarmCode = [====[
 if getgenv().FarmPaused == nil then getgenv().FarmPaused = false end
@@ -1681,50 +1698,82 @@ local function ServerHopLogic(reason)
     queueResume()
 
     task.spawn(function()
-        local cursor = ""
-        while getgenv().IsHopping and task.wait(1) do
-            local url = "https://games.roblox.com/v1/games/" .. tostring(game.PlaceId) .. "/servers/Public?sortOrder=Asc&limit=100"
+        local req = request or http_request or (syn and syn.request)
+        -- one page of the server list is fetched and then worked through, so a failed teleport moves on to
+        -- the next server instead of asking Roblox for the list again: asking too often gets it rate-limited
+        -- (429), and retrying every second kept it that way
+        local candidates, cursor, failures = {}, "", 0
+        local teleportFailed = false
+        local failConn = TeleportService.TeleportInitFailed:Connect(function(player)
+            if player == LocalPlayer then teleportFailed = true end
+        end)
+        local function waitTeleport()
+            local start = tick()
+            while getgenv().IsHopping and not teleportFailed and tick() - start < 12 do task.wait(0.25) end
+        end
+        -- the list from roblox.com, or from the proxy when roblox.com fails or rate-limits; nil if both do
+        local function fetchPage()
+            local url = "https://games.roblox.com/v1/games/" .. tostring(game.PlaceId) .. "/servers/Public?sortOrder=Asc&excludeFullGames=true&limit=100"
             if cursor ~= "" then url = url .. "&cursor=" .. cursor end
-            
-            local req = (request or http_request or (syn and syn.request))
-            local decoded = nil
-            
-            if req then
-                local s, res = pcall(function() return req({Url = url, Method = "GET"}) end)
-                if not s or not res or not res.Body then
-                    local proxiedUrl = string.gsub(url, "games%.roblox%.com", "games.roproxy.com")
-                    s, res = pcall(function() return req({Url = proxiedUrl, Method = "GET"}) end)
-                end
+            for _, u in ipairs({url, (string.gsub(url, "games%.roblox%.com", "games.roproxy.com"))}) do
+                local s, res = pcall(function() return req({Url = u, Method = "GET"}) end)
+                local decoded
                 if s and res and res.Body then pcall(function() decoded = HttpService:JSONDecode(res.Body) end) end
+                if type(decoded) == "table" and type(decoded.data) == "table" then return decoded end
             end
-            
-            if decoded and decoded.data then
-                local servers = {}
+        end
+
+        while getgenv().IsHopping do
+            if #candidates == 0 then
+                local decoded = req and fetchPage()
+                if not decoded then
+                    failures = failures + 1
+                    if not req or failures >= 3 then
+                        -- no list to pick from: a plain rejoin still lands on a random server; if it has no
+                        -- vaults the farm just hops again from there
+                        failures = 0
+                        setStatus("Server list unavailable, rejoining a random server")
+                        teleportFailed = false
+                        pcall(function() TeleportService:Teleport(game.PlaceId, LocalPlayer) end)
+                        waitTeleport()
+                    else
+                        local delay = 4 * failures
+                        setStatus("Server list rate-limited, retrying in " .. delay .. "s")
+                        task.wait(delay)
+                    end
+                    continue
+                end
+                failures = 0
                 for _, v in ipairs(decoded.data) do
                     if type(v) == "table" and v.playing and v.playing >= 1 and v.playing <= 15 then
                         local id = tostring(v.id)
                         if id ~= tostring(game.JobId) and not recentlyVisited(id) then
-                            table.insert(servers, id)
+                            table.insert(candidates, math.random(1, #candidates + 1), id)
                         end
                     end
                 end
-                
-                if #servers > 0 then
-                    local targetServer = servers[math.random(1, #servers)]
-                    pcall(function()
-                        TeleportService:TeleportToPlaceInstance(game.PlaceId, targetServer, LocalPlayer)
-                    end)
-                    task.wait(10)
-                elseif decoded.nextPageCursor then
-                    cursor = decoded.nextPageCursor
-                else
-                    -- every listed server was emptied in the last 16 minutes; give them time to refill
-                    cursor = ""
-                    setStatus("All servers recently farmed, waiting")
-                    task.wait(15)
+                cursor = decoded.nextPageCursor or ""
+                if #candidates == 0 then
+                    if cursor == "" then
+                        -- every listed server was emptied in the last 16 minutes; give them time to refill
+                        setStatus("All servers recently farmed, waiting")
+                        task.wait(15)
+                    else
+                        task.wait(1)
+                    end
+                    continue
                 end
             end
+            setStatus("Joining a new server (" .. #candidates .. " left)")
+            local targetServer = table.remove(candidates)
+            teleportFailed = false
+            pcall(function()
+                TeleportService:TeleportToPlaceInstance(game.PlaceId, targetServer, LocalPlayer)
+            end)
+            -- a failed teleport (server filled up, shut down) moves on to the next one right away
+            waitTeleport()
         end
+        failConn:Disconnect()
     end)
 end
 
