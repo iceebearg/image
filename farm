@@ -1,0 +1,2432 @@
+getgenv().Webhook = ""
+getgenv().StaffDetector = true
+getgenv().UseMask = true
+getgenv().Disable3DRender = true
+getgenv().BlackScreen = true
+getgenv().FPSCap = 0
+
+local VaultFarmCode = [====[
+if getgenv().FarmPaused == nil then getgenv().FarmPaused = false end
+
+-- re-running the script replaces this token, so every loop and connection from an older run stops on its own
+local sessionToken = {}
+getgenv().VaultSessionToken = sessionToken
+local function running()
+    return shared.VaultFarm and getgenv().VaultSessionToken == sessionToken
+end
+
+if not game:IsLoaded() then game.Loaded:Wait() end
+
+local CoreGui = game:GetService("CoreGui")
+local Players = game:GetService("Players")
+local HttpService = game:GetService("HttpService")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local TeleportService = game:GetService("TeleportService")
+local VIM = game:GetService("VirtualInputManager")
+local Stats = game:GetService("Stats")
+
+while not Players.LocalPlayer do task.wait() end
+local LocalPlayer = Players.LocalPlayer
+
+task.spawn(function()
+    local vim = game:GetService("VirtualInputManager")
+    while task.wait(300) and getgenv().VaultSessionToken == sessionToken do
+        pcall(function()
+            vim:SendMouseButtonEvent(0, 0, 0, true, game, 0)
+            task.wait(0.05)
+            vim:SendMouseButtonEvent(0, 0, 0, false, game, 0)
+        end)
+    end
+end)
+
+-- settings changed from the menu are remembered across hops and restarts; the values at the
+-- top of the script only act as defaults until the menu has saved something
+local CONFIG_FILE = "VaultFarm_Config.json"
+local CONFIG_KEYS = {"StaffDetector", "UseMask", "Disable3DRender", "BlackScreen", "FPSCap", "StopKeybindName"}
+local savedConfig = {}
+pcall(function()
+    local data = HttpService:JSONDecode(readfile(CONFIG_FILE))
+    if type(data) == "table" then savedConfig = data end
+end)
+for _, key in ipairs(CONFIG_KEYS) do
+    if savedConfig[key] ~= nil then getgenv()[key] = savedConfig[key] end
+end
+
+local function saveConfig()
+    if not writefile then return end
+    for _, key in ipairs(CONFIG_KEYS) do
+        savedConfig[key] = getgenv()[key]
+    end
+    pcall(function() writefile(CONFIG_FILE, HttpService:JSONEncode(savedConfig)) end)
+end
+
+local function applyPerformanceSettings()
+    pcall(function() RunService:Set3dRenderingEnabled(getgenv().Disable3DRender ~= true) end)
+    local cap = tonumber(getgenv().FPSCap) or 0
+    if setfpscap and cap > 0 then pcall(setfpscap, cap) end
+end
+applyPerformanceSettings()
+
+local safeFirePrompt = fireproximityprompt or function() end
+local safeFireTouch = function(part1, part2, state)
+    if part1 and part2 then
+        pcall(function()
+            if firetouchinterest then firetouchinterest(part1, part2, state) end
+        end)
+    end
+end
+local safeFireClick = function(cd)
+    if cd then
+        pcall(function()
+            if fireclickdetector then fireclickdetector(cd)
+            elseif firesignal then firesignal(cd.MouseClick) end
+        end)
+    end
+end
+
+local function isDead()
+    local c = Players.LocalPlayer.Character
+    if not c then return true end
+    local h = c:FindFirstChild("Humanoid")
+    if not h or h.Health <= 0 then return true end
+    return false
+end
+
+local function getTool(exactName)
+    if not exactName then return nil end
+    local lp = Players.LocalPlayer
+    local char = lp and lp.Character
+    local bp = lp and lp:FindFirstChild("Backpack")
+    local realName = string.lower(string.gsub(string.gsub(exactName, "%[", ""), "%]", ""))
+    if char then
+        for _, v in ipairs(char:GetChildren()) do
+            if v:IsA("Tool") and string.find(string.lower(v.Name), realName, 1, true) then return v end
+        end
+    end
+    if bp then
+        for _, v in ipairs(bp:GetChildren()) do
+            if v:IsA("Tool") and string.find(string.lower(v.Name), realName, 1, true) then return v end
+        end
+    end
+    return nil
+end
+
+local shopCache = {}
+local shopMissUntil = {}
+local function findShopPart(keyword)
+    local cached = shopCache[keyword]
+    if cached and cached[1].Parent and cached[2].Parent then return cached[1], cached[2], cached[3] end
+    -- a miss scans the whole map, so don't retry it every frame
+    if shopMissUntil[keyword] and tick() < shopMissUntil[keyword] then return nil, nil, nil end
+    local targetSearchName = string.lower(string.gsub(string.gsub(keyword, "%[", ""), "%]", ""))
+    local searchFolders = {workspace:FindFirstChild("Ignored"), workspace:FindFirstChild("Shops"), workspace}
+    for _, folder in ipairs(searchFolders) do
+        if folder then
+            for _, obj in ipairs(folder:GetDescendants()) do
+                local name = string.lower(obj.Name)
+                if not string.find(name, "carpet") and not string.find(name, "dhc") and not string.find(name, "skin") and not string.find(name, "crate") and not string.find(name, "launcher") then
+                    if string.find(name, targetSearchName, 1, true) then
+                        if not (targetSearchName == "drum-shotgun" and string.find(name, "ammo")) then
+                            local cd = obj:FindFirstChildWhichIsA("ClickDetector", true)
+                            local pp = obj:FindFirstChildWhichIsA("ProximityPrompt", true)
+                            local part = obj:IsA("BasePart") and obj or obj:FindFirstChild("Head", true) or obj:FindFirstChildWhichIsA("BasePart", true)
+                            if cd and part then shopCache[keyword] = {part, cd, pp} return part, cd, pp end
+                        end
+                    end
+                end
+            end
+        end
+    end
+    shopMissUntil[keyword] = tick() + 2
+    return nil, nil, nil
+end
+
+local function triggerShopInteraction(shopPart, cd, pp)
+    local hrp = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+    if not hrp then return end
+    if cd then pcall(function() safeFireClick(cd) end) end
+    if pp then pcall(function() safeFirePrompt(pp) end) end
+    if shopPart then
+        pcall(function()
+            safeFireTouch(hrp, shopPart, 0)
+            task.wait()
+            safeFireTouch(hrp, shopPart, 1)
+        end)
+    end
+    task.wait(0.02)
+end
+
+local safePlatform = Instance.new("Part")
+safePlatform.Name = "AutoFarmPlatform"
+safePlatform.Size = Vector3.new(5, 1, 5)
+safePlatform.Transparency = 1
+safePlatform.Anchored = true
+safePlatform.CanCollide = true
+safePlatform.Parent = workspace
+
+local lockedTargetCFrame = nil
+
+local function securePosition(hrp, targetPos, lookData)
+    if getgenv().FarmPaused then return end
+    if hrp and targetPos then
+        safePlatform.CFrame = CFrame.new(targetPos.X, targetPos.Y - 3.5, targetPos.Z)
+        local myPos = Vector3.new(targetPos.X, targetPos.Y - 0.5, targetPos.Z)
+        if typeof(lookData) == "Vector3" then
+            if (lookData - myPos).Magnitude > 0.01 then
+                local lookDir = (lookData - myPos).Unit
+                if math.abs(lookDir.Y) > 0.99 then
+                    lockedTargetCFrame = CFrame.new(myPos) * CFrame.Angles(math.rad(-90 * math.sign(lookDir.Y)), 0, 0)
+                else
+                    lockedTargetCFrame = CFrame.lookAt(myPos, lookData)
+                end
+            else
+                lockedTargetCFrame = CFrame.new(myPos) * hrp.CFrame.Rotation
+            end
+        elseif typeof(lookData) == "CFrame" then
+            lockedTargetCFrame = CFrame.new(myPos) * lookData.Rotation
+        else
+            lockedTargetCFrame = CFrame.new(myPos) * hrp.CFrame.Rotation
+        end
+        hrp.CFrame = lockedTargetCFrame
+        hrp.AssemblyLinearVelocity = Vector3.zero
+        hrp.AssemblyAngularVelocity = Vector3.zero
+    end
+end
+
+local function FormatMoney(amount)
+    local formatted = tostring(amount)
+    local k
+    while true do
+        formatted, k = string.gsub(formatted, "^(-?%d+)(%d%d%d)", "%1.%2")
+        if k == 0 then break end
+    end
+    return formatted
+end
+
+local function FormatTime(seconds)
+    local h = math.floor(seconds / 3600)
+    local m = math.floor((seconds % 3600) / 60)
+    local s = math.floor(seconds % 60)
+    return string.format("%02d:%02d:%02d", h, m, s)
+end
+
+shared.MoneyFarm = false
+shared.VaultFarm = true
+getgenv().IsHopping = false
+
+local n1 = 2
+local n2 = 35
+
+-- servers we've been in, stamped with when we were last there. Vaults refill about 16 minutes
+-- after being emptied, so a server becomes worth joining again once that much time has passed.
+-- Kept in a file so it survives server hops and game restarts.
+local VISITED_FILE = "VaultFarm_Visited.json"
+local VAULT_REFILL_SECONDS = 16 * 60
+local visitedServers = {}
+pcall(function()
+    local data = HttpService:JSONDecode(readfile(VISITED_FILE))
+    if type(data) == "table" then visitedServers = data end
+end)
+
+local function recentlyVisited(jobId)
+    local t = visitedServers[jobId]
+    return type(t) == "number" and os.time() - t < VAULT_REFILL_SECONDS
+end
+
+local function markVisited(jobId)
+    if not jobId or jobId == "" then return end
+    for id in pairs(visitedServers) do
+        if not recentlyVisited(id) then visitedServers[id] = nil end
+    end
+    visitedServers[jobId] = os.time()
+    if writefile then
+        pcall(function() writefile(VISITED_FILE, HttpService:JSONEncode(visitedServers)) end)
+    end
+end
+markVisited(tostring(game.JobId))
+
+local sessionMoney = getgenv().SavedSessionMoney or 0
+getgenv().SavedSessionTime = getgenv().SavedSessionTime or 0
+
+local hopEarned = 0
+local currentSpawnSetup = false
+local lastVaultCashOffset = Vector3.zero 
+
+local TweenService = game:GetService("TweenService")
+
+pcall(function()
+    for _, name in ipairs({"VaultAutoFarmGUI", "VaultBlackScreen", "DaHoodHub", "Selfb0tControllerUI"}) do
+        local old = CoreGui:FindFirstChild(name)
+        if old then old:Destroy() end
+    end
+end)
+
+local Theme = {
+    Panel = Color3.fromRGB(26, 26, 30),
+    PanelTop = Color3.fromRGB(46, 46, 52),
+    PanelBottom = Color3.fromRGB(22, 22, 26),
+    White = Color3.new(1, 1, 1),
+    Black = Color3.new(0, 0, 0),
+    Text = Color3.fromRGB(245, 245, 247),
+    Muted = Color3.fromRGB(152, 152, 160),
+    Dim = Color3.fromRGB(99, 99, 106),
+    Track = Color3.fromRGB(62, 62, 68),
+    Accent = Color3.fromRGB(10, 132, 255),
+    Accent2 = Color3.fromRGB(100, 210, 255),
+    Gold = Color3.fromRGB(255, 214, 10),
+    Green = Color3.fromRGB(48, 209, 88),
+    Red = Color3.fromRGB(255, 69, 58),
+    RedText = Color3.fromRGB(255, 125, 117),
+}
+
+-- Icons: a Roblox image id ("123456"), a hosted PNG ("https://raw.githubusercontent.com/you/repo/main/money.png",
+-- downloaded once per user) or a PNG in your own workspace folder ("file:VaultFarm/money.png", only you see it).
+-- Leave "" to hide that icon. A sprite sheet is a table instead of a string:
+--   money = {id = "file:VaultFarm/money_sheet.png", cols = 8, rows = 8, frames = 60, fps = 30, size = 1024}
+-- (cell = one frame's size in pixels, or size = the sheet's width when cells fill it exactly;
+--  frames = cells actually used; spins = cycles per one-shot play; loopFps = speed when looping)
+local ICON_HOST = "https://raw.githubusercontent.com/iceebearg/image/main/"
+local Icons = {
+    vault = ICON_HOST .. "boveda-circular.png",     -- Dashboard tab, "Breaking Vaults"
+    -- 6x4 grid of 170px cells: two quick spins per payout, a calmer loop while picking up cash
+    money = {id = ICON_HOST .. "dhc-sheet-roblox.png", cols = 6, rows = 4, frames = 24, cell = 170, fps = 60, spins = 2, loopFps = 30},
+    grenade = ICON_HOST .. "granada.png",          -- "Buying [Grenade]", "Throwing Grenade"
+    drumgun = ICON_HOST .. "drumgun.png",          -- "Buying [Drum-Shotgun]" and its ammo
+    settings = "",
+    clock = "",
+    server = "",
+    trend = "",
+    screen = "",
+    cube = "",
+    shield = "",
+    mask = ICON_HOST .. "mascara.png",             -- "Buying ... Mask", "Use mask" setting
+    gauge = "",
+    keyboard = "",
+    pause = "",
+    play = "",
+    stop = "",
+}
+
+local FONT_FAMILY = "rbxasset://fonts/families/GothamSSm.json"
+local SHADOW = "rbxassetid://6014261993"
+local W, FULL_H, MINI_H = 340, 460, 72
+
+local function font(weight)
+    return Font.new(FONT_FAMILY, weight or Enum.FontWeight.Medium)
+end
+
+local function tween(obj, duration, props, style, direction, repeatCount, reverses)
+    local t = TweenService:Create(obj, TweenInfo.new(duration, style or Enum.EasingStyle.Quint, direction or Enum.EasingDirection.Out, repeatCount or 0, reverses or false), props)
+    t:Play()
+    return t
+end
+
+local function create(className, parent, props)
+    local inst = Instance.new(className)
+    for k, v in pairs(props) do inst[k] = v end
+    inst.Parent = parent
+    return inst
+end
+
+local function corner(parent, radius)
+    return create("UICorner", parent, {CornerRadius = typeof(radius) == "UDim" and radius or UDim.new(0, radius)})
+end
+
+local function label(parent, props)
+    props.BackgroundTransparency = 1
+    props.AutoLocalize = false
+    props.FontFace = props.FontFace or font()
+    props.TextColor3 = props.TextColor3 or Theme.Text
+    props.TextXAlignment = props.TextXAlignment or Enum.TextXAlignment.Left
+    return create("TextLabel", parent, props)
+end
+
+-- glass edge: light catches the top rim, fades through the middle and comes back faintly at the bottom
+local function specular(parent, topTransparency)
+    local stroke = create("UIStroke", parent, {
+        Color = Theme.White,
+        Thickness = 1,
+        ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+    })
+    create("UIGradient", stroke, {
+        Rotation = 90,
+        Transparency = NumberSequence.new({
+            NumberSequenceKeypoint.new(0, topTransparency or 0.7),
+            NumberSequenceKeypoint.new(0.5, 0.93),
+            NumberSequenceKeypoint.new(1, 0.85),
+        }),
+    })
+    return stroke
+end
+
+local function glass(parent, props, className, radius)
+    props.BackgroundColor3 = props.BackgroundColor3 or Theme.White
+    props.BackgroundTransparency = props.BackgroundTransparency or 0.955
+    props.BorderSizePixel = 0
+    if className == "TextButton" then
+        props.AutoButtonColor = false
+        props.AutoLocalize = false
+        props.Text = props.Text or ""
+    end
+    local f = create(className or "Frame", parent, props)
+    corner(f, radius or 14)
+    -- a gradient would also fade the button's own text, so only plain surfaces get the top-lit fill
+    if f.ClassName ~= "TextButton" or f.Text == "" then
+        create("UIGradient", f, {Rotation = 90, Transparency = NumberSequence.new(0, 0.6)})
+    end
+    return f, specular(f, 0.72)
+end
+
+local sprites = {}
+
+local localAssets = {}
+local getLocalAsset = getcustomasset or getsynasset
+
+-- downloads a hosted PNG once into the executor's workspace folder; later runs read it from disk
+local function downloadIcon(url)
+    local name = string.match(url, "([^/?#]+)[^/]*$")
+    if not name or not writefile then return nil end
+    local path = "VaultFarm/icons/" .. name
+    local exists = false
+    pcall(function() exists = isfile(path) end)
+    if not exists then
+        local ok, body = pcall(function() return game:HttpGet(url) end)
+        if not ok or type(body) ~= "string" or #body == 0 then return nil end
+        pcall(function()
+            if makefolder then
+                makefolder("VaultFarm")
+                makefolder("VaultFarm/icons")
+            end
+            writefile(path, body)
+        end)
+    end
+    return path
+end
+
+local function assetUrl(id)
+    if not id or id == "" then return nil end
+    if tonumber(id) then return "rbxassetid://" .. id end
+    if string.find(id, "^https?://") then
+        if localAssets[id] == nil then
+            local path = downloadIcon(id)
+            local ok, url = pcall(function() return getLocalAsset(path) end)
+            localAssets[id] = (path and ok and url) or false
+        end
+        return localAssets[id] or nil
+    end
+    -- "file:VaultFarm/money.png" loads a PNG from the executor's workspace folder, no upload needed
+    local path = string.match(id, "^file:(.+)$")
+    if path then
+        if localAssets[path] == nil then
+            local ok, url = pcall(function() return getLocalAsset(path) end)
+            localAssets[path] = ok and url or false
+        end
+        return localAssets[path] or nil
+    end
+    return id
+end
+
+local function iconImage(name)
+    local def = Icons[name]
+    return assetUrl(type(def) == "table" and def.id or def)
+end
+
+local function setSpriteFrame(img, def, frame)
+    local size = def.size or 1024
+    local fw, fh = def.cell or size / def.cols, def.cell or size / def.rows
+    img.ImageRectSize = Vector2.new(fw, fh)
+    img.ImageRectOffset = Vector2.new((frame % def.cols) * fw, math.floor(frame / def.cols) * fh)
+end
+
+-- points an ImageLabel at an icon; sprite sheets loop unless autoplay is false
+local function applyIcon(img, name, autoplay)
+    local def = Icons[name]
+    img.Image = iconImage(name) or ""
+    if type(def) == "table" and def.cols and def.rows then
+        setSpriteFrame(img, def, 0)
+        sprites[img] = {def = def, time = 0, frame = 0, playing = autoplay ~= false, loop = autoplay ~= false}
+    else
+        img.ImageRectSize = Vector2.zero
+        img.ImageRectOffset = Vector2.zero
+        sprites[img] = nil
+    end
+end
+
+local function playSprite(img)
+    local s = sprites[img]
+    if s then s.time, s.frame, s.playing = 0, -1, true end
+end
+
+local function icon(parent, name, size, props, autoplay)
+    if not iconImage(name) then return nil end
+    props = props or {}
+    props.BackgroundTransparency = 1
+    props.Size = UDim2.fromOffset(size, size)
+    props.ImageColor3 = props.ImageColor3 or Theme.Text
+    local img = create("ImageLabel", parent, props)
+    applyIcon(img, name, autoplay)
+    return img
+end
+
+local function addPressEffect(button)
+    local scale = create("UIScale", button, {})
+    local base = button.BackgroundTransparency
+    button.MouseEnter:Connect(function() tween(button, 0.2, {BackgroundTransparency = base - 0.03}) end)
+    button.MouseLeave:Connect(function()
+        tween(button, 0.2, {BackgroundTransparency = base})
+        tween(scale, 0.3, {Scale = 1})
+    end)
+    button.MouseButton1Down:Connect(function() tween(scale, 0.12, {Scale = 0.96}, Enum.EasingStyle.Quad) end)
+    button.MouseButton1Up:Connect(function() tween(scale, 0.5, {Scale = 1}, Enum.EasingStyle.Back) end)
+end
+
+local function buttonContent(button, iconName, text, color)
+    local content = create("Frame", button, {
+        AnchorPoint = Vector2.new(0.5, 0.5),
+        Position = UDim2.fromScale(0.5, 0.5),
+        Size = UDim2.fromScale(0, 1),
+        AutomaticSize = Enum.AutomaticSize.X,
+        BackgroundTransparency = 1,
+    })
+    create("UIListLayout", content, {
+        FillDirection = Enum.FillDirection.Horizontal,
+        VerticalAlignment = Enum.VerticalAlignment.Center,
+        Padding = UDim.new(0, 7),
+        SortOrder = Enum.SortOrder.LayoutOrder,
+    })
+    local img = icon(content, iconName, 15, {LayoutOrder = 1, ImageColor3 = color})
+    local textLabel = label(content, {
+        LayoutOrder = 2,
+        Size = UDim2.fromScale(0, 1),
+        AutomaticSize = Enum.AutomaticSize.X,
+        Text = text,
+        FontFace = font(Enum.FontWeight.SemiBold),
+        TextSize = 14,
+        TextColor3 = color,
+    })
+    return textLabel, img
+end
+
+local function reveal(items)
+    for i, item in ipairs(items) do
+        local frame, base = item[1], item[2]
+        frame.Position = base + UDim2.fromOffset(0, 10)
+        task.delay((i - 1) * 0.045, function()
+            tween(frame, 0.5, {Position = base})
+        end)
+    end
+end
+
+local function formatShort(n)
+    n = math.floor(n)
+    if n >= 1e9 then return string.format("%.2fB", n / 1e9) end
+    if n >= 1e6 then return string.format("%.2fM", n / 1e6) end
+    if n >= 1e3 then return string.format("%.1fK", n / 1e3) end
+    return tostring(n)
+end
+
+local blackGui = create("ScreenGui", CoreGui, {
+    Name = "VaultBlackScreen",
+    IgnoreGuiInset = true,
+    ResetOnSpawn = false,
+    DisplayOrder = 0,
+    Enabled = getgenv().BlackScreen == true,
+})
+create("Frame", blackGui, {Size = UDim2.fromScale(1, 1), BackgroundColor3 = Theme.Black, BorderSizePixel = 0})
+
+local gui = create("ScreenGui", CoreGui, {
+    Name = "VaultAutoFarmGUI",
+    ResetOnSpawn = false,
+    IgnoreGuiInset = true,
+    DisplayOrder = 10,
+    ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+})
+local uiConns = {}
+gui.Destroying:Connect(function()
+    for _, c in ipairs(uiConns) do c:Disconnect() end
+end)
+
+-- toasts
+local toastHolder = create("Frame", gui, {
+    AnchorPoint = Vector2.new(1, 1),
+    Position = UDim2.new(1, -20, 1, -20),
+    Size = UDim2.fromOffset(270, 300),
+    BackgroundTransparency = 1,
+})
+create("UIListLayout", toastHolder, {
+    Padding = UDim.new(0, 8),
+    VerticalAlignment = Enum.VerticalAlignment.Bottom,
+    SortOrder = Enum.SortOrder.LayoutOrder,
+})
+local toasts = {}
+local toastOrder = 0
+
+local function notify(title, text, color)
+    if not gui.Parent then return end
+    toastOrder = toastOrder + 1
+    local wrap = create("Frame", toastHolder, {LayoutOrder = toastOrder, Size = UDim2.new(1, 0, 0, 54), BackgroundTransparency = 1})
+    table.insert(toasts, wrap)
+    if #toasts > 4 then table.remove(toasts, 1):Destroy() end
+
+    local card = create("Frame", wrap, {
+        Position = UDim2.new(1, 30, 0, 0),
+        Size = UDim2.fromScale(1, 1),
+        BackgroundColor3 = Theme.Panel,
+        BackgroundTransparency = 0.06,
+        BorderSizePixel = 0,
+    })
+    corner(card, 14)
+    specular(card, 0.65)
+    local dot = create("Frame", card, {
+        AnchorPoint = Vector2.new(0, 0.5),
+        Position = UDim2.new(0, 14, 0.5, 0),
+        Size = UDim2.fromOffset(8, 8),
+        BackgroundColor3 = color or Theme.Accent,
+        BorderSizePixel = 0,
+    })
+    corner(dot, UDim.new(1, 0))
+    label(card, {Position = UDim2.fromOffset(32, 9), Size = UDim2.new(1, -44, 0, 18), Text = title, FontFace = font(Enum.FontWeight.SemiBold), TextSize = 13})
+    label(card, {Position = UDim2.fromOffset(32, 27), Size = UDim2.new(1, -44, 0, 16), Text = text, TextSize = 12, TextColor3 = Theme.Muted, TextTruncate = Enum.TextTruncate.AtEnd})
+
+    tween(card, 0.55, {Position = UDim2.fromScale(0, 0)}, Enum.EasingStyle.Back)
+    task.delay(3.5, function()
+        if not card.Parent then return end
+        tween(card, 0.3, {Position = UDim2.new(1, 30, 0, 0)}, Enum.EasingStyle.Quad, Enum.EasingDirection.In).Completed:Wait()
+        local i = table.find(toasts, wrap)
+        if i then table.remove(toasts, i) end
+        wrap:Destroy()
+    end)
+end
+
+-- window
+-- starts on the left so it stays clear of the screen center, where the farm clicks
+local DEFAULT_PANEL_POS = UDim2.new(0, 24, 0.5, -FULL_H / 2)
+local savedPos = savedConfig.PanelPosition
+local holder = create("Frame", gui, {
+    Position = type(savedPos) == "table" and #savedPos == 4 and UDim2.new(savedPos[1], savedPos[2], savedPos[3], savedPos[4]) or DEFAULT_PANEL_POS,
+    Size = UDim2.fromOffset(W, savedConfig.Minimized and MINI_H or FULL_H),
+    BackgroundTransparency = 1,
+    Visible = false,
+})
+local holderScale = create("UIScale", holder, {Scale = 0.94})
+
+create("ImageLabel", holder, {
+    AnchorPoint = Vector2.new(0.5, 0.5),
+    Position = UDim2.new(0.5, 0, 0.5, 10),
+    Size = UDim2.new(1, 56, 1, 56),
+    BackgroundTransparency = 1,
+    Image = SHADOW,
+    ImageColor3 = Theme.Black,
+    ImageTransparency = 0.45,
+    ScaleType = Enum.ScaleType.Slice,
+    SliceCenter = Rect.new(49, 49, 450, 450),
+})
+
+local main = create("Frame", holder, {
+    Size = UDim2.fromScale(1, 1),
+    BackgroundColor3 = Theme.White,
+    BackgroundTransparency = 0.04,
+    BorderSizePixel = 0,
+    ClipsDescendants = true,
+})
+corner(main, 22)
+create("UIGradient", main, {Rotation = 90, Color = ColorSequence.new(Theme.PanelTop, Theme.PanelBottom)})
+specular(main, 0.5)
+local sheen = create("Frame", main, {Size = UDim2.new(1, 0, 0, 140), BackgroundColor3 = Theme.White, BorderSizePixel = 0})
+corner(sheen, 22)
+create("UIGradient", sheen, {Rotation = 90, Transparency = NumberSequence.new(0.95, 1)})
+
+-- header
+local header = create("Frame", main, {
+    Position = UDim2.fromOffset(18, 18),
+    Size = UDim2.new(1, -36, 0, 40),
+    BackgroundTransparency = 1,
+    Active = true,
+})
+local avatar = create("ImageLabel", header, {
+    Size = UDim2.fromOffset(40, 40),
+    BackgroundColor3 = Theme.White,
+    BackgroundTransparency = 0.92,
+    BorderSizePixel = 0,
+    Image = "rbxthumb://type=AvatarHeadShot&id=" .. tostring(LocalPlayer.UserId) .. "&w=150&h=150",
+})
+corner(avatar, UDim.new(1, 0))
+specular(avatar, 0.6)
+label(header, {
+    Position = UDim2.fromOffset(52, 2),
+    Size = UDim2.new(1, -160, 0, 18),
+    Text = LocalPlayer.DisplayName,
+    FontFace = font(Enum.FontWeight.SemiBold),
+    TextSize = 15,
+    TextTruncate = Enum.TextTruncate.AtEnd,
+})
+-- discreet live readout of Roblox's memory use
+local memoryLabel = label(header, {
+    AnchorPoint = Vector2.new(1, 0),
+    Position = UDim2.new(1, -40, 0, 4),
+    Size = UDim2.fromOffset(60, 14),
+    Text = "",
+    TextSize = 11,
+    TextColor3 = Theme.Dim,
+    TextXAlignment = Enum.TextXAlignment.Right,
+})
+local statusDot = create("Frame", header, {
+    AnchorPoint = Vector2.new(0, 0.5),
+    Position = UDim2.new(0, 53, 0, 30),
+    Size = UDim2.fromOffset(6, 6),
+    BackgroundColor3 = Theme.Green,
+    BorderSizePixel = 0,
+})
+corner(statusDot, UDim.new(1, 0))
+tween(statusDot, 1.4, {BackgroundTransparency = 0.6}, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true)
+local statusIcon = create("ImageLabel", header, {
+    AnchorPoint = Vector2.new(0, 0.5),
+    Position = UDim2.new(0, 63, 0, 30),
+    Size = UDim2.fromOffset(14, 14),
+    BackgroundTransparency = 1,
+    ImageColor3 = Theme.White,
+    Visible = false,
+})
+local statusIconScale = create("UIScale", statusIcon, {})
+local StatusLabel = label(header, {
+    Position = UDim2.fromOffset(65, 22),
+    Size = UDim2.new(1, -113, 0, 16),
+    Text = "Starting",
+    TextSize = 12,
+    TextColor3 = Theme.Muted,
+    TextTruncate = Enum.TextTruncate.AtEnd,
+})
+
+-- minus that morphs into a plus when minimized
+local minimizeBtn = glass(header, {
+    AnchorPoint = Vector2.new(1, 0.5),
+    Position = UDim2.new(1, 0, 0.5, 0),
+    Size = UDim2.fromOffset(30, 30),
+    BackgroundTransparency = 0.93,
+}, "TextButton", 15)
+addPressEffect(minimizeBtn)
+local minusBar = create("Frame", minimizeBtn, {
+    AnchorPoint = Vector2.new(0.5, 0.5),
+    Position = UDim2.fromScale(0.5, 0.5),
+    Size = UDim2.fromOffset(10, 2),
+    BackgroundColor3 = Theme.Text,
+    BorderSizePixel = 0,
+})
+corner(minusBar, 1)
+local plusBar = create("Frame", minimizeBtn, {
+    AnchorPoint = Vector2.new(0.5, 0.5),
+    Position = UDim2.fromScale(0.5, 0.5),
+    Size = UDim2.fromOffset(2, savedConfig.Minimized and 10 or 0),
+    BackgroundColor3 = Theme.Text,
+    BorderSizePixel = 0,
+})
+corner(plusBar, 1)
+
+-- segmented control
+local segment = glass(main, {Position = UDim2.fromOffset(18, 72), Size = UDim2.new(1, -36, 0, 32), BackgroundTransparency = 0.95}, nil, 10)
+local segIndicator = create("Frame", segment, {
+    Position = UDim2.fromOffset(2, 2),
+    Size = UDim2.new(0.5, -2, 1, -4),
+    BackgroundColor3 = Theme.White,
+    BackgroundTransparency = 0.86,
+    BorderSizePixel = 0,
+})
+corner(segIndicator, 8)
+specular(segIndicator, 0.55)
+
+local pages = create("Frame", main, {
+    Position = UDim2.fromOffset(18, 118),
+    Size = UDim2.new(1, -36, 0, 270),
+    BackgroundTransparency = 1,
+    ClipsDescendants = true,
+})
+local dashboard = create("Frame", pages, {Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1})
+local settingsPage = create("ScrollingFrame", pages, {
+    Position = UDim2.new(1, 18, 0, 0),
+    Size = UDim2.fromScale(1, 1),
+    BackgroundTransparency = 1,
+    BorderSizePixel = 0,
+    ScrollBarThickness = 2,
+    ScrollBarImageColor3 = Theme.White,
+    ScrollBarImageTransparency = 0.7,
+    VerticalScrollBarInset = Enum.ScrollBarInset.ScrollBar,
+    ScrollingDirection = Enum.ScrollingDirection.Y,
+    CanvasSize = UDim2.new(),
+})
+local dashCards, settingsCards = {}, {}
+
+local tabLabels, tabIcons = {}, {}
+local currentTab = 1
+local function selectTab(index)
+    if index == currentTab then return end
+    currentTab = index
+    tween(segIndicator, 0.5, {Position = index == 1 and UDim2.fromOffset(2, 2) or UDim2.new(0.5, 0, 0, 2)}, Enum.EasingStyle.Back)
+    for i = 1, 2 do
+        local color = i == index and Theme.Text or Theme.Muted
+        tween(tabLabels[i], 0.25, {TextColor3 = color})
+        if tabIcons[i] then tween(tabIcons[i], 0.25, {ImageColor3 = color}) end
+    end
+    tween(dashboard, 0.5, {Position = index == 1 and UDim2.new() or UDim2.new(-1, -18, 0, 0)})
+    tween(settingsPage, 0.5, {Position = index == 2 and UDim2.new() or UDim2.new(1, 18, 0, 0)})
+    reveal(index == 1 and dashCards or settingsCards)
+end
+for i, tab in ipairs({{"vault", "Dashboard"}, {"settings", "Settings"}}) do
+    local b = create("TextButton", segment, {
+        Position = UDim2.fromScale((i - 1) * 0.5, 0),
+        Size = UDim2.fromScale(0.5, 1),
+        BackgroundTransparency = 1,
+        AutoButtonColor = false,
+        Text = "",
+        ZIndex = 2,
+    })
+    local color = i == 1 and Theme.Text or Theme.Muted
+    local textLabel, img = buttonContent(b, tab[1], tab[2], color)
+    textLabel.TextSize = 13
+    tabLabels[i], tabIcons[i] = textLabel, img
+    b.MouseButton1Click:Connect(function() selectTab(i) end)
+end
+
+-- dashboard
+local hero = glass(dashboard, {Size = UDim2.new(1, 0, 0, 96)}, nil, 16)
+table.insert(dashCards, {hero, hero.Position})
+label(hero, {
+    Position = UDim2.fromOffset(16, 14),
+    Size = UDim2.new(1, -32, 0, 14),
+    Text = "Session earnings",
+    TextSize = 12,
+    TextColor3 = Theme.Muted,
+})
+local moneyIcon = icon(hero, "money", 28, {
+    AnchorPoint = Vector2.new(0, 0.5),
+    Position = UDim2.new(0, 14, 0, 48),
+    ImageColor3 = Theme.White,
+}, false)
+local moneyIconScale = moneyIcon and create("UIScale", moneyIcon, {})
+local cashCounter = label(hero, {
+    Position = UDim2.fromOffset(moneyIcon and 50 or 16, 30),
+    Size = UDim2.new(1, moneyIcon and -66 or -32, 0, 36),
+    Text = "$" .. FormatMoney(sessionMoney),
+    FontFace = font(Enum.FontWeight.Bold),
+    TextSize = 30,
+    TextTruncate = Enum.TextTruncate.AtEnd,
+})
+label(hero, {
+    Position = UDim2.fromOffset(16, 70),
+    Size = UDim2.new(1, -32, 0, 14),
+    Text = "Across every server this session",
+    TextSize = 11,
+    TextColor3 = Theme.Dim,
+})
+
+local function miniStat(index, iconName, caption, value)
+    local card = glass(dashboard, {
+        Position = UDim2.new((index - 1) / 3, (index - 1) * 3, 0, 104),
+        Size = UDim2.new(1 / 3, -6, 0, 60),
+    }, nil, 14)
+    table.insert(dashCards, {card, card.Position})
+    local img = icon(card, iconName, 12, {AnchorPoint = Vector2.new(0, 0.5), Position = UDim2.new(0, 12, 0, 18), ImageColor3 = Theme.Muted})
+    label(card, {
+        Position = UDim2.fromOffset(img and 29 or 12, 11),
+        Size = UDim2.new(1, -40, 0, 14),
+        Text = caption,
+        TextSize = 11,
+        TextColor3 = Theme.Muted,
+    })
+    return label(card, {
+        Position = UDim2.fromOffset(12, 29),
+        Size = UDim2.new(1, -24, 0, 20),
+        Text = value,
+        FontFace = font(Enum.FontWeight.SemiBold),
+        TextSize = 15,
+        TextTruncate = Enum.TextTruncate.AtEnd,
+    })
+end
+local timeLabel = miniStat(1, "clock", "Time", FormatTime(getgenv().SavedSessionTime))
+local serverValue = miniStat(2, "server", "Server", "$0")
+local rateValue = miniStat(3, "trend", "Per hour", "—")
+
+-- per-server history, kept in a file so it survives server hops and game restarts
+local HISTORY_FILE = "VaultFarm_History.json"
+local BAR_COUNT = 24
+local history = {}
+pcall(function()
+    local data = HttpService:JSONDecode(readfile(HISTORY_FILE))
+    if type(data) == "table" then history = data end
+end)
+for _, e in ipairs(history) do
+    e.earned = tonumber(e.earned) or 0
+    e.seconds = tonumber(e.seconds) or 0
+end
+local currentEntry = history[#history]
+if not currentEntry or currentEntry.id ~= game.JobId then
+    currentEntry = {id = game.JobId, earned = 0, seconds = 0, t = os.time()}
+    table.insert(history, currentEntry)
+    while #history > BAR_COUNT do table.remove(history, 1) end
+end
+serverValue.Text = "$" .. formatShort(currentEntry.earned)
+
+local function saveHistory()
+    if not writefile then return end
+    pcall(function() writefile(HISTORY_FILE, HttpService:JSONEncode(history)) end)
+end
+
+local function historyRate()
+    local earned, seconds = 0, 0
+    for _, e in ipairs(history) do
+        earned = earned + e.earned
+        seconds = seconds + e.seconds
+    end
+    if seconds < 60 then return nil end
+    return earned / (seconds / 3600)
+end
+
+local function formatDuration(seconds)
+    seconds = math.floor(seconds)
+    if seconds >= 3600 then return string.format("%dh %dm", math.floor(seconds / 3600), math.floor(seconds % 3600 / 60)) end
+    if seconds >= 60 then return string.format("%dm %ds", math.floor(seconds / 60), seconds % 60) end
+    return seconds .. "s"
+end
+
+local function entryAt(i)
+    return history[#history - BAR_COUNT + i]
+end
+
+local chart = glass(dashboard, {Position = UDim2.fromOffset(0, 172), Size = UDim2.new(1, 0, 0, 98)}, nil, 16)
+table.insert(dashCards, {chart, chart.Position})
+label(chart, {
+    Position = UDim2.fromOffset(16, 12),
+    Size = UDim2.new(0.5, 0, 0, 14),
+    Text = "Servers",
+    TextSize = 12,
+    TextColor3 = Theme.Muted,
+})
+local chartCount = label(chart, {
+    AnchorPoint = Vector2.new(1, 0),
+    Position = UDim2.new(1, -16, 0, 12),
+    Size = UDim2.new(0.5, 0, 0, 14),
+    Text = "",
+    TextSize = 11,
+    TextColor3 = Theme.Dim,
+    TextXAlignment = Enum.TextXAlignment.Right,
+})
+local barArea = create("Frame", chart, {
+    Position = UDim2.fromOffset(16, 34),
+    Size = UDim2.new(1, -32, 1, -48),
+    BackgroundTransparency = 1,
+})
+
+local tooltip = create("Frame", chart, {
+    AnchorPoint = Vector2.new(0.5, 1),
+    Size = UDim2.fromOffset(150, 60),
+    BackgroundColor3 = Theme.Panel,
+    BackgroundTransparency = 0.02,
+    BorderSizePixel = 0,
+    Visible = false,
+    ZIndex = 10,
+})
+corner(tooltip, 12)
+specular(tooltip, 0.6)
+local tooltipScale = create("UIScale", tooltip, {Scale = 0.9})
+local tipTitle = label(tooltip, {Position = UDim2.fromOffset(12, 8), Size = UDim2.new(1, -24, 0, 14), TextSize = 11, TextColor3 = Theme.Muted, ZIndex = 11})
+local tipMoney = label(tooltip, {Position = UDim2.fromOffset(12, 22), Size = UDim2.new(1, -24, 0, 18), FontFace = font(Enum.FontWeight.Bold), TextSize = 15, ZIndex = 11})
+local tipMeta = label(tooltip, {Position = UDim2.fromOffset(12, 41), Size = UDim2.new(1, -24, 0, 12), TextSize = 10, TextColor3 = Theme.Dim, TextTruncate = Enum.TextTruncate.AtEnd, ZIndex = 11})
+
+local bars, barHeights = {}, {}
+local hoveredIndex
+
+local function hideTooltip()
+    if not tooltip.Visible then return end
+    tween(tooltipScale, 0.12, {Scale = 0.9}, Enum.EasingStyle.Quad, Enum.EasingDirection.In).Completed:Connect(function()
+        if not hoveredIndex then tooltip.Visible = false end
+    end)
+end
+
+local function showTooltip(i, instant)
+    local e = entryAt(i)
+    if not e then
+        hideTooltip()
+        return
+    end
+    local isCurrent = e == currentEntry
+    tipTitle.Text = isCurrent and "This server" or ("Server #" .. (#history - BAR_COUNT + i))
+    tipMoney.Text = "$" .. FormatMoney(math.floor(e.earned))
+    tipMoney.TextColor3 = isCurrent and Theme.Green or Theme.Text
+    tipMeta.Text = string.sub(tostring(e.id), 1, 8) .. "  ·  " .. formatDuration(e.seconds)
+
+    -- place it above the bar's final height, from sizes only so the reveal animation can't skew it
+    local areaSize = barArea.AbsoluteSize
+    local x = math.clamp(16 + areaSize.X * (i - 0.5) / BAR_COUNT, 80, chart.AbsoluteSize.X - 80)
+    local y = 34 + areaSize.Y * (1 - barHeights[i]) - 6
+    local target = UDim2.fromOffset(x, y)
+    if not tooltip.Visible then
+        tooltip.Position = target + UDim2.fromOffset(0, 6)
+        tooltip.Visible = true
+        tooltipScale.Scale = 0.9
+        tween(tooltipScale, 0.35, {Scale = 1}, Enum.EasingStyle.Back)
+    end
+    tween(tooltip, instant and 0 or 0.2, {Position = target})
+end
+
+local function renderChart()
+    local maxValue = 0
+    for _, e in ipairs(history) do
+        if e.earned > maxValue then maxValue = e.earned end
+    end
+    for i = 1, BAR_COUNT do
+        local e = entryAt(i)
+        local h = (e and maxValue > 0) and math.max(e.earned / maxValue, 0.08) or 0.08
+        barHeights[i] = h
+        local color, transparency = Theme.White, 0.92
+        if e then
+            local isCurrent = e == currentEntry
+            color = isCurrent and Theme.Green or Theme.White
+            transparency = hoveredIndex == i and 0 or (isCurrent and 0.1 or 0.55)
+        end
+        tween(bars[i], 0.6, {Size = UDim2.new(1, -4, h, 0), BackgroundColor3 = color, BackgroundTransparency = transparency})
+    end
+    chartCount.Text = #history == 1 and "1 server" or (#history .. " servers")
+    if hoveredIndex then showTooltip(hoveredIndex, true) end
+end
+
+for i = 1, BAR_COUNT do
+    local column = create("Frame", barArea, {
+        Position = UDim2.fromScale((i - 1) / BAR_COUNT, 0),
+        Size = UDim2.fromScale(1 / BAR_COUNT, 1),
+        BackgroundTransparency = 1,
+    })
+    local bar = create("Frame", column, {
+        AnchorPoint = Vector2.new(0.5, 1),
+        Position = UDim2.fromScale(0.5, 1),
+        Size = UDim2.new(1, -4, 0.08, 0),
+        BackgroundColor3 = Theme.White,
+        BackgroundTransparency = 0.92,
+        BorderSizePixel = 0,
+    })
+    corner(bar, 3)
+    bars[i], barHeights[i] = bar, 0.08
+    column.MouseEnter:Connect(function()
+        hoveredIndex = i
+        renderChart()
+        showTooltip(i)
+    end)
+    column.MouseLeave:Connect(function()
+        if hoveredIndex ~= i then return end
+        hoveredIndex = nil
+        renderChart()
+        hideTooltip()
+    end)
+end
+renderChart()
+
+task.spawn(function()
+    while running() and gui.Parent do
+        task.wait(10)
+        renderChart()
+        saveHistory()
+    end
+end)
+
+local statusColors = {LIVE = Theme.Green, PAUSED = Theme.Gold, HOPPING = Theme.Red}
+local lastMode = "LIVE"
+
+local function statusIconFor(text)
+    text = string.lower(text)
+    if string.find(text, "grenade") or string.find(text, "granade") then return "grenade" end
+    if string.find(text, "drum") or string.find(text, "ammo") then return "drumgun" end
+    if string.find(text, "breaking vault") then return "vault" end
+    if string.find(text, "cash") then return "money" end
+    if string.find(text, "mask") then return "mask" end
+    if string.find(text, "hop") then return "server" end
+    return nil
+end
+
+local function setStatus(txt)
+    pcall(function()
+        if not StatusLabel.Parent then return end
+        local mode = getgenv().FarmPaused and "PAUSED" or (getgenv().IsHopping and "HOPPING" or "LIVE")
+        local newText = mode == "PAUSED" and "Paused" or tostring(txt)
+        if StatusLabel.Text ~= newText then
+            local iconName = statusIconFor(newText)
+            local hasIcon = iconName ~= nil and iconImage(iconName) ~= nil
+            if hasIcon then
+                applyIcon(statusIcon, iconName, true)
+                statusIcon.Visible = true
+                statusIconScale.Scale = 0.5
+                tween(statusIconScale, 0.45, {Scale = 1}, Enum.EasingStyle.Back)
+            else
+                statusIcon.Visible = false
+            end
+            local x = hasIcon and 82 or 65
+            StatusLabel.Text = newText
+            StatusLabel.Position = UDim2.fromOffset(x, 26)
+            StatusLabel.TextTransparency = 1
+            tween(StatusLabel, 0.35, {Position = UDim2.fromOffset(x, 22), TextTransparency = 0})
+        end
+        if mode ~= lastMode then
+            lastMode = mode
+            tween(statusDot, 0.3, {BackgroundColor3 = statusColors[mode]})
+        end
+    end)
+end
+
+local moneyValue = Instance.new("NumberValue")
+moneyValue.Value = sessionMoney
+moneyValue.Changed:Connect(function(v)
+    cashCounter.Text = "$" .. FormatMoney(math.floor(v + 0.5))
+end)
+
+local function onMoneyGained(diff)
+    tween(moneyValue, 1, {Value = sessionMoney}, Enum.EasingStyle.Quart)
+    currentEntry.earned = currentEntry.earned + diff
+    serverValue.Text = "$" .. formatShort(currentEntry.earned)
+    renderChart()
+    cashCounter.TextColor3 = Theme.Green
+    tween(cashCounter, 1.2, {TextColor3 = Theme.Text}, Enum.EasingStyle.Quad)
+    if moneyIcon then
+        playSprite(moneyIcon)
+        moneyIconScale.Scale = 1.25
+        tween(moneyIconScale, 0.6, {Scale = 1}, Enum.EasingStyle.Back)
+    end
+    local pop = label(hero, {
+        AnchorPoint = Vector2.new(1, 0),
+        Position = UDim2.new(1, -16, 0, 38),
+        Size = UDim2.fromOffset(150, 18),
+        Text = "+$" .. FormatMoney(diff),
+        FontFace = font(Enum.FontWeight.SemiBold),
+        TextSize = 13,
+        TextColor3 = Theme.Green,
+        TextXAlignment = Enum.TextXAlignment.Right,
+    })
+    tween(pop, 1.2, {Position = UDim2.new(1, -16, 0, 22), TextTransparency = 1}, Enum.EasingStyle.Quad)
+    task.delay(1.3, function() pop:Destroy() end)
+end
+
+-- settings
+local function settingRow(order, iconName, title, desc)
+    local row = glass(settingsPage, {Position = UDim2.fromOffset(0, (order - 1) * 54), Size = UDim2.new(1, 0, 0, 46)}, nil, 14)
+    table.insert(settingsCards, {row, row.Position})
+    local img = icon(row, iconName, 18, {AnchorPoint = Vector2.new(0, 0.5), Position = UDim2.new(0, 14, 0.5, 0), ImageColor3 = Theme.Muted})
+    local x = img and 44 or 16
+    label(row, {
+        Position = UDim2.fromOffset(x, 7),
+        Size = UDim2.new(1, -x - 110, 0, 17),
+        Text = title,
+        FontFace = font(Enum.FontWeight.SemiBold),
+        TextSize = 13,
+    })
+    label(row, {
+        Position = UDim2.fromOffset(x, 24),
+        Size = UDim2.new(1, -x - 110, 0, 14),
+        Text = desc,
+        TextSize = 11,
+        TextColor3 = Theme.Dim,
+        TextTruncate = Enum.TextTruncate.AtEnd,
+    })
+    return row
+end
+
+local function createToggle(order, iconName, title, desc, initial, onChange)
+    local row = settingRow(order, iconName, title, desc)
+    local hit = create("TextButton", row, {
+        Size = UDim2.fromScale(1, 1),
+        BackgroundTransparency = 1,
+        AutoButtonColor = false,
+        Text = "",
+        ZIndex = 3,
+    })
+    local track = create("Frame", row, {
+        AnchorPoint = Vector2.new(1, 0.5),
+        Position = UDim2.new(1, -14, 0.5, 0),
+        Size = UDim2.fromOffset(44, 26),
+        BackgroundColor3 = Theme.Track,
+        BorderSizePixel = 0,
+    })
+    corner(track, UDim.new(1, 0))
+    local knob = create("Frame", track, {
+        AnchorPoint = Vector2.new(0, 0.5),
+        Position = UDim2.new(0, 2, 0.5, 0),
+        Size = UDim2.fromOffset(22, 22),
+        BackgroundColor3 = Theme.White,
+        BorderSizePixel = 0,
+    })
+    corner(knob, UDim.new(1, 0))
+    create("UIStroke", knob, {Color = Theme.Black, Transparency = 0.85, Thickness = 1})
+
+    local state = initial
+    local function render(animate)
+        tween(track, animate and 0.25 or 0, {BackgroundColor3 = state and Theme.Green or Theme.Track}, Enum.EasingStyle.Quad)
+        tween(knob, animate and 0.45 or 0, {
+            AnchorPoint = state and Vector2.new(1, 0.5) or Vector2.new(0, 0.5),
+            Position = state and UDim2.new(1, -2, 0.5, 0) or UDim2.new(0, 2, 0.5, 0),
+            Size = UDim2.fromOffset(22, 22),
+        }, Enum.EasingStyle.Back)
+    end
+    render(false)
+
+    -- the knob stretches while pressed, like iOS
+    hit.MouseButton1Down:Connect(function() tween(knob, 0.15, {Size = UDim2.fromOffset(27, 22)}, Enum.EasingStyle.Quad) end)
+    hit.MouseEnter:Connect(function() tween(row, 0.2, {BackgroundTransparency = 0.935}) end)
+    hit.MouseLeave:Connect(function()
+        tween(row, 0.2, {BackgroundTransparency = 0.955})
+        tween(knob, 0.2, {Size = UDim2.fromOffset(22, 22)})
+    end)
+    hit.MouseButton1Click:Connect(function()
+        state = not state
+        render(true)
+        onChange(state)
+        saveConfig()
+        notify(title, state and "On" or "Off", state and Theme.Green or Theme.Muted)
+    end)
+end
+
+createToggle(1, "screen", "Black screen", "Covers the game", getgenv().BlackScreen == true, function(on)
+    getgenv().BlackScreen = on
+    blackGui.Enabled = on
+end)
+createToggle(2, "cube", "Disable 3D render", "Saves CPU and GPU", getgenv().Disable3DRender == true, function(on)
+    getgenv().Disable3DRender = on
+    applyPerformanceSettings()
+end)
+createToggle(3, "shield", "Staff detector", "Hops when staff joins", getgenv().StaffDetector ~= false, function(on)
+    getgenv().StaffDetector = on
+end)
+createToggle(4, "mask", "Use mask", "Hides your name, applies on respawn", getgenv().UseMask ~= false, function(on)
+    getgenv().UseMask = on
+end)
+
+local fpsOptions = {0, 15, 30, 60, 120}
+local fpsIndex = 1
+for i, v in ipairs(fpsOptions) do
+    if v == (tonumber(getgenv().FPSCap) or 0) then fpsIndex = i end
+end
+local fpsRow = settingRow(5, "gauge", "FPS cap", "Limit frames per second")
+local fpsValue = label(fpsRow, {
+    AnchorPoint = Vector2.new(1, 0.5),
+    Position = UDim2.new(1, -42, 0.5, 0),
+    Size = UDim2.fromOffset(40, 20),
+    FontFace = font(Enum.FontWeight.SemiBold),
+    TextSize = 13,
+    TextXAlignment = Enum.TextXAlignment.Center,
+})
+local function renderFps(animate)
+    local v = fpsOptions[fpsIndex]
+    fpsValue.Text = v == 0 and "Off" or tostring(v)
+    if animate then
+        fpsValue.TextTransparency = 1
+        tween(fpsValue, 0.25, {TextTransparency = 0})
+    end
+end
+renderFps(false)
+local function fpsArrow(glyph, xOffset, delta)
+    local b = glass(fpsRow, {
+        AnchorPoint = Vector2.new(1, 0.5),
+        Position = UDim2.new(1, xOffset, 0.5, 0),
+        Size = UDim2.fromOffset(26, 26),
+        BackgroundTransparency = 0.93,
+    }, "TextButton", 13)
+    label(b, {Size = UDim2.fromScale(1, 1), Text = glyph, FontFace = font(Enum.FontWeight.SemiBold), TextSize = 15, TextXAlignment = Enum.TextXAlignment.Center})
+    addPressEffect(b)
+    b.MouseButton1Click:Connect(function()
+        local nextIndex = math.clamp(fpsIndex + delta, 1, #fpsOptions)
+        if nextIndex == fpsIndex then return end
+        fpsIndex = nextIndex
+        local v = fpsOptions[fpsIndex]
+        getgenv().FPSCap = v
+        saveConfig()
+        renderFps(true)
+        if setfpscap then pcall(setfpscap, v > 0 and v or 999) end
+    end)
+end
+fpsArrow("‹", -84, -1)
+fpsArrow("›", -14, 1)
+
+local keyRow = settingRow(6, "keyboard", "Stop key", "Right Shift hides the menu")
+settingsPage.CanvasSize = UDim2.fromOffset(0, #settingsCards * 54 - 8)
+local KeybindBtn = glass(keyRow, {
+    AnchorPoint = Vector2.new(1, 0.5),
+    Position = UDim2.new(1, -14, 0.5, 0),
+    Size = UDim2.fromOffset(84, 28),
+    BackgroundTransparency = 0.92,
+    Text = "None",
+    FontFace = font(Enum.FontWeight.SemiBold),
+    TextSize = 12,
+    TextColor3 = Theme.Text,
+    TextTruncate = Enum.TextTruncate.AtEnd,
+}, "TextButton", 9)
+addPressEffect(KeybindBtn)
+
+-- footer
+local footer = create("Frame", main, {
+    Position = UDim2.fromOffset(18, FULL_H - 58),
+    Size = UDim2.new(1, -36, 0, 40),
+    BackgroundTransparency = 1,
+})
+local PauseBtn = glass(footer, {Size = UDim2.new(0.5, -5, 1, 0), BackgroundTransparency = 0.9}, "TextButton", 14)
+local pauseLabel, pauseIcon = buttonContent(PauseBtn, getgenv().FarmPaused and "play" or "pause", getgenv().FarmPaused and "Resume" or "Pause", Theme.Text)
+addPressEffect(PauseBtn)
+local UnloadButton = glass(footer, {
+    AnchorPoint = Vector2.new(1, 0),
+    Position = UDim2.fromScale(1, 0),
+    Size = UDim2.new(0.5, -5, 1, 0),
+    BackgroundColor3 = Theme.Red,
+    BackgroundTransparency = 0.8,
+}, "TextButton", 14)
+buttonContent(UnloadButton, "stop", "Stop", Theme.RedText)
+addPressEffect(UnloadButton)
+
+-- drag, minimize, show/hide
+local dragging, dragStart, startPos, dragTarget
+header.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+        dragging = true
+        dragStart = input.Position
+        startPos = holder.Position
+        dragTarget = nil
+    end
+end)
+table.insert(uiConns, UserInputService.InputEnded:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+        if dragging and dragTarget then
+            savedConfig.PanelPosition = {dragTarget.X.Scale, dragTarget.X.Offset, dragTarget.Y.Scale, dragTarget.Y.Offset}
+            saveConfig()
+        end
+        dragging = false
+    end
+end))
+table.insert(uiConns, UserInputService.InputChanged:Connect(function(input)
+    if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+        local delta = input.Position - dragStart
+        dragTarget = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+        tween(holder, 0.15, {Position = dragTarget}, Enum.EasingStyle.Quad)
+    end
+end))
+
+local minimized = savedConfig.Minimized == true
+minimizeBtn.MouseButton1Click:Connect(function()
+    minimized = not minimized
+    savedConfig.Minimized = minimized
+    saveConfig()
+    tween(plusBar, 0.35, {Size = UDim2.fromOffset(2, minimized and 10 or 0)}, Enum.EasingStyle.Back)
+    tween(holder, 0.55, {Size = UDim2.fromOffset(W, minimized and MINI_H or FULL_H)})
+end)
+
+local uiVisible = false
+local function setVisible(visible)
+    uiVisible = visible
+    if visible then
+        holder.Visible = true
+        holderScale.Scale = 0.94
+        tween(holderScale, 0.55, {Scale = 1}, Enum.EasingStyle.Back)
+        if not minimized then reveal(currentTab == 1 and dashCards or settingsCards) end
+    else
+        tween(holderScale, 0.18, {Scale = 0.94}, Enum.EasingStyle.Quad, Enum.EasingDirection.In).Completed:Connect(function()
+            if not uiVisible then holder.Visible = false end
+        end)
+    end
+end
+table.insert(uiConns, UserInputService.InputBegan:Connect(function(input, gp)
+    if not gp and input.KeyCode == Enum.KeyCode.RightShift then
+        setVisible(not uiVisible)
+    end
+end))
+
+PauseBtn.MouseButton1Click:Connect(function()
+    getgenv().FarmPaused = not getgenv().FarmPaused
+    local paused = getgenv().FarmPaused
+    pauseLabel.Text = paused and "Resume" or "Pause"
+    if pauseIcon and iconImage(paused and "play" or "pause") then applyIcon(pauseIcon, paused and "play" or "pause") end
+    setStatus(paused and "Paused" or "Resuming")
+    notify(paused and "Paused" or "Resumed", paused and "Farm is on hold" or "Back to farming", paused and Theme.Gold or Theme.Green)
+end)
+
+local stopKey = nil
+if getgenv().StopKeybindName and getgenv().StopKeybindName ~= "" then
+    pcall(function() stopKey = Enum.KeyCode[getgenv().StopKeybindName] end)
+end
+if stopKey then KeybindBtn.Text = stopKey.Name end
+
+task.spawn(function()
+    while running() do
+        task.wait(1)
+        if not getgenv().FarmPaused then
+            getgenv().SavedSessionTime = getgenv().SavedSessionTime + 1
+            currentEntry.seconds = currentEntry.seconds + 1
+        end
+        if timeLabel.Parent then
+            memoryLabel.Text = string.format("%d MB", Stats:GetTotalMemoryUsageMb())
+            timeLabel.Text = FormatTime(getgenv().SavedSessionTime)
+            local rate = historyRate()
+            rateValue.Text = rate and ("$" .. formatShort(rate)) or "—"
+        end
+    end
+end)
+
+-- a single heartbeat drives every sprite sheet, and only while the menu is on screen
+table.insert(uiConns, RunService.Heartbeat:Connect(function(dt)
+    if not holder.Visible then return end
+    for img, s in pairs(sprites) do
+        if not img.Parent then
+            sprites[img] = nil
+        elseif s.playing then
+            s.time = s.time + dt
+            local frames = s.def.frames or (s.def.cols * s.def.rows)
+            local fps = s.loop and (s.def.loopFps or s.def.fps) or s.def.fps
+            local step = math.floor(s.time * (fps or 24))
+            local frame = step % frames
+            -- a one-shot play (a payout) runs `spins` full cycles, then rests on the first frame
+            if not s.loop and step >= frames * (s.def.spins or 1) then
+                frame, s.playing = 0, false
+            end
+            if frame ~= s.frame then
+                s.frame = frame
+                setSpriteFrame(img, s.def, frame)
+            end
+        end
+    end
+end))
+
+setVisible(true)
+
+-- a position saved on a bigger screen could leave the panel out of view; bring it back if so
+task.defer(function()
+    local view, p = gui.AbsoluteSize, holder.AbsolutePosition
+    if p.X < -W / 2 or p.Y < 0 or p.X > view.X - 60 or p.Y > view.Y - 60 then
+        holder.Position = DEFAULT_PANEL_POS
+    end
+end)
+
+notify("Vault Farm", getgenv().VaultWebhookSent and "Joined a new server" or "Farm started", Theme.Accent)
+
+-- every farm click goes through here: if the menu was dragged over the click point,
+-- hide it for that instant so the click reaches the game instead of a menu button
+local function overlapsMenu(x, y)
+    if not gui.Parent or not gui.Enabled or not holder.Visible then return false end
+    local pos, size = main.AbsolutePosition, main.AbsoluteSize
+    return x >= pos.X and x <= pos.X + size.X and y >= pos.Y and y <= pos.Y + size.Y
+end
+
+local function clickCenter(holdTime)
+    local cam = workspace.CurrentCamera
+    if not cam then return end
+    local center = cam.ViewportSize / 2
+    local hide = overlapsMenu(center.X, center.Y)
+    if hide then gui.Enabled = false end
+    pcall(function() VIM:SendMouseButtonEvent(center.X, center.Y, 0, true, game, 0) end)
+    task.wait(holdTime or 0.05)
+    pcall(function() VIM:SendMouseButtonEvent(center.X, center.Y, 0, false, game, 0) end)
+    if hide and gui.Parent then gui.Enabled = true end
+end
+
+local renderConn
+task.spawn(function()
+    renderConn = RunService.RenderStepped:Connect(function()
+        if not running() then
+            if renderConn then renderConn:Disconnect() end
+            return
+        end
+        pcall(function()
+            local pg = Players.LocalPlayer:FindFirstChild("PlayerGui")
+            if pg then
+                local main = pg:FindFirstChild("MainScreenGui")
+                if main then
+                    local sp = main:FindFirstChild("SettingsPanel")
+                    if sp and not sp:FindFirstChild("SwitchFrame") then
+                        local dummy = Instance.new("Frame")
+                        dummy.Name = "SwitchFrame"
+                        dummy.Visible = false
+                        dummy.Parent = sp
+                    end
+                end
+            end
+        end)
+    end)
+end)
+
+local function CheckVaultsExist()
+    local cashiers = workspace:WaitForChild("Cashiers", 10)
+    if not cashiers then return false end 
+    local count = 0
+    for _, child in ipairs(cashiers:GetChildren()) do
+        if string.find(string.upper(child.Name), "VAULT") then
+            local hum = child:FindFirstChild("Humanoid")
+            local head = child:FindFirstChild("Head") or child:FindFirstChild("Part")
+            if hum and hum.Health > 0 and head then count = count + 1 end
+        end
+    end
+    return count > 0
+end
+
+local function SendWebhook(actionName)
+    local url = getgenv().Webhook
+    if type(url) ~= "string" or not string.find(url, "^https://") then return end
+    local req = request or http_request or (syn and syn.request)
+    if not req then return end
+    local data = {
+        ["embeds"] = {{
+            ["title"] = "Vault Farm",
+            ["color"] = 16774400,
+            ["fields"] = {
+                {["name"] = "Account", ["value"] = LocalPlayer.Name, ["inline"] = true},
+                {["name"] = "Status", ["value"] = tostring(actionName), ["inline"] = false},
+                {["name"] = "Earned this server", ["value"] = "$" .. FormatMoney(hopEarned), ["inline"] = true},
+                {["name"] = "Total session", ["value"] = "$" .. FormatMoney(sessionMoney), ["inline"] = true},
+                {["name"] = "Session time", ["value"] = FormatTime(getgenv().SavedSessionTime or 0), ["inline"] = true}
+            }
+        }}
+    }
+    pcall(function()
+        req({
+            Url = url,
+            Method = "POST",
+            Headers = {["Content-Type"] = "application/json"},
+            Body = HttpService:JSONEncode(data)
+        })
+    end)
+end
+
+-- queues the farm to start again by itself after the next teleport, carrying the session over
+local resumeQueued = false
+local function queueResume()
+    if resumeQueued then return end
+    local qot = queue_on_teleport or queueonteleport or (syn and syn.queue_on_teleport)
+    if qot then
+        resumeQueued = true
+        local currentMask = getgenv().mask or ""
+        local skName = getgenv().StopKeybindName or ""
+        local fpState = tostring(getgenv().FarmPaused or false)
+        local webhookUrl = tostring(getgenv().Webhook or "")
+        local staffState = tostring(getgenv().StaffDetector ~= false)
+        local maskState = tostring(getgenv().UseMask ~= false)
+        local render3DState = tostring(getgenv().Disable3DRender == true)
+        local blackState = tostring(getgenv().BlackScreen == true)
+        local fpsCap = math.floor(tonumber(getgenv().FPSCap) or 0)
+        local totalTime = math.floor(getgenv().SavedSessionTime)
+        local hopTime = os.time()
+        
+        local qot_script = string.format([[
+        task.spawn(function()
+            if os.time() - %d > 600 then return end
+            repeat task.wait() until game:IsLoaded()
+            task.wait(2)
+            getgenv().VaultWebhookSent = true
+            getgenv().SavedSessionMoney = %d
+            getgenv().SavedSessionTime = %d
+            getgenv().mask = "%s"
+            getgenv().StopKeybindName = "%s"
+            getgenv().FarmPaused = %s
+            getgenv().Webhook = %q
+            getgenv().StaffDetector = %s
+            getgenv().UseMask = %s
+            getgenv().Disable3DRender = %s
+            getgenv().BlackScreen = %s
+            getgenv().FPSCap = %d
+            pcall(function()
+                if readfile and loadstring then
+                    local cached = readfile("Vault_Cache.lua")
+                    if cached and #cached > 10 then
+                        local func = loadstring(cached)
+                        if func then task.spawn(func) end
+                    end
+                end
+            end)
+        end)
+        ]], hopTime, sessionMoney or 0, totalTime, currentMask, skName, fpState, webhookUrl, staffState, maskState, render3DState, blackState, fpsCap)
+        pcall(function() qot(qot_script) end)
+    end
+end
+
+local function ServerHopLogic(reason)
+    if getgenv().IsHopping then return end
+    getgenv().IsHopping = true
+    setStatus(reason or "Server Hopping (Proxied)...")
+    task.spawn(SendWebhook, "Server hop: " .. tostring(reason or "Server Hopping"))
+    notify("Server hop", tostring(reason or "Finding a new server"), Theme.Red)
+    saveHistory()
+    -- stamped on the way out, since the vaults start refilling from the moment we emptied them
+    markVisited(tostring(game.JobId))
+    shared.VaultFarm = false
+    queueResume()
+
+    task.spawn(function()
+        local cursor = ""
+        while getgenv().IsHopping and task.wait(1) do
+            local url = "https://games.roblox.com/v1/games/" .. tostring(game.PlaceId) .. "/servers/Public?sortOrder=Asc&limit=100"
+            if cursor ~= "" then url = url .. "&cursor=" .. cursor end
+            
+            local req = (request or http_request or (syn and syn.request))
+            local decoded = nil
+            
+            if req then
+                local s, res = pcall(function() return req({Url = url, Method = "GET"}) end)
+                if not s or not res or not res.Body then
+                    local proxiedUrl = string.gsub(url, "games%.roblox%.com", "games.roproxy.com")
+                    s, res = pcall(function() return req({Url = proxiedUrl, Method = "GET"}) end)
+                end
+                if s and res and res.Body then pcall(function() decoded = HttpService:JSONDecode(res.Body) end) end
+            end
+            
+            if decoded and decoded.data then
+                local servers = {}
+                for _, v in ipairs(decoded.data) do
+                    if type(v) == "table" and v.playing and v.playing >= 1 and v.playing <= 15 then
+                        local id = tostring(v.id)
+                        if id ~= tostring(game.JobId) and not recentlyVisited(id) then
+                            table.insert(servers, id)
+                        end
+                    end
+                end
+                
+                if #servers > 0 then
+                    local targetServer = servers[math.random(1, #servers)]
+                    pcall(function()
+                        TeleportService:TeleportToPlaceInstance(game.PlaceId, targetServer, LocalPlayer)
+                    end)
+                    task.wait(10)
+                elseif decoded.nextPageCursor then
+                    cursor = decoded.nextPageCursor
+                else
+                    -- every listed server was emptied in the last 16 minutes; give them time to refill
+                    cursor = ""
+                    setStatus("All servers recently farmed, waiting")
+                    task.wait(15)
+                end
+            end
+        end
+    end)
+end
+
+-- when Roblox shows a disconnect or kick prompt mid-farm, rejoin the game; the queued script
+-- picks the farm back up on the other side
+local GuiService = game:GetService("GuiService")
+local reconnecting = false
+local errorPromptConn
+errorPromptConn = GuiService.ErrorMessageChanged:Connect(function(message)
+    if getgenv().VaultSessionToken ~= sessionToken then
+        errorPromptConn:Disconnect()
+        return
+    end
+    if reconnecting or not message or message == "" then return end
+    if not (shared.VaultFarm or getgenv().IsHopping) then return end
+    reconnecting = true
+    saveHistory()
+    markVisited(tostring(game.JobId))
+    queueResume()
+    task.spawn(function()
+        while true do
+            pcall(function() TeleportService:Teleport(game.PlaceId, LocalPlayer) end)
+            task.wait(8)
+        end
+    end)
+end)
+
+local function checkOpps()
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= LocalPlayer then
+            local str = p.Name .. (p.DisplayName or "")
+            for i = 1, #str do
+                if string.byte(str, i) > 127 then return true end
+            end
+        end
+    end
+    return false
+end
+
+task.spawn(function()
+    while running() and task.wait(2) do
+        if getgenv().StaffDetector ~= false and checkOpps() and not getgenv().IsHopping then
+            ServerHopLogic("Staff detected, hopping.")
+        end
+    end
+end)
+
+local startCFrame = nil
+local initialCharacter = LocalPlayer and LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
+local initialRoot = initialCharacter and (initialCharacter:FindFirstChild("HumanoidRootPart") or initialCharacter:WaitForChild("HumanoidRootPart", 5))
+if initialRoot then startCFrame = initialRoot.CFrame end
+
+local UISConn
+local noclipConn
+local forceResetConn
+local antiStompConn
+local antiSeatConn
+local lockConn
+local hasReset = false
+
+local function UnloadEverything()
+    if not running() then return end
+    shared.VaultFarm = false
+    saveHistory()
+    getgenv().FarmPaused = false
+    getgenv().IsHopping = false 
+    
+    pcall(function()
+        if writefile then
+            writefile("DHC_Cache.lua", "")
+            writefile("Vault_Cache.lua", "")
+        end
+    end)
+    
+    pcall(function() gui:Destroy() end)
+    pcall(function() blackGui:Destroy() end)
+    pcall(function() if CoreGui:FindFirstChild("VaultAutoFarmGUI") then CoreGui.VaultAutoFarmGUI:Destroy() end end)
+    
+    if UISConn then pcall(function() UISConn:Disconnect() end) end
+    if noclipConn then pcall(function() noclipConn:Disconnect() end) end
+    if forceResetConn then pcall(function() forceResetConn:Disconnect() end) end
+    if antiStompConn then pcall(function() antiStompConn:Disconnect() end) end
+    if antiSeatConn then pcall(function() antiSeatConn:Disconnect() end) end
+    if lockConn then pcall(function() lockConn:Disconnect() end) end
+    
+    LocalPlayer.CameraMode = Enum.CameraMode.Classic
+    lockedTargetCFrame = nil
+    pcall(function() RunService:Set3dRenderingEnabled(true) end)
+    if setfpscap and (tonumber(getgenv().FPSCap) or 0) > 0 then pcall(setfpscap, 60) end
+    
+    task.spawn(function()
+        SendWebhook("Stopped Farm", sessionMoney)
+    end)
+    
+    pcall(function()
+        if safePlatform and safePlatform.Parent then
+            safePlatform:Destroy()
+        end
+    end)
+    
+    local char = LocalPlayer and LocalPlayer.Character
+    if char and char:FindFirstChild("Humanoid") then
+        char.Humanoid.Health = 0
+    end
+    
+    local connection
+    connection = LocalPlayer.CharacterAdded:Connect(function(newChar)
+        local root = newChar:WaitForChild("HumanoidRootPart", 5)
+        if root and startCFrame then
+            task.wait(0.3)
+            root.CFrame = startCFrame
+            root.AssemblyLinearVelocity = Vector3.zero
+            root.AssemblyAngularVelocity = Vector3.zero
+        end
+        if connection then connection:Disconnect() end
+    end)
+end
+
+UnloadButton.MouseButton1Click:Connect(UnloadEverything)
+
+local isBinding = false
+KeybindBtn.MouseButton1Click:Connect(function()
+    isBinding = true
+    KeybindBtn.Text = "Press a key"
+end)
+
+UISConn = UserInputService.InputBegan:Connect(function(input, gp)
+    if getgenv().VaultSessionToken ~= sessionToken then
+        UISConn:Disconnect()
+        return
+    end
+    if isBinding and input.UserInputType == Enum.UserInputType.Keyboard then
+        stopKey = input.KeyCode
+        getgenv().StopKeybindName = stopKey.Name
+        saveConfig()
+        KeybindBtn.Text = stopKey.Name
+        isBinding = false
+        notify("Stop keybind", "Set to " .. stopKey.Name, Theme.Accent2)
+    elseif not gp and stopKey and input.KeyCode == stopKey then
+        UnloadEverything()
+    end
+end)
+
+local lockHeartbeatConn
+lockHeartbeatConn = RunService.Heartbeat:Connect(function()
+    if not running() then
+        if lockHeartbeatConn then lockHeartbeatConn:Disconnect() end
+        return
+    end
+    if getgenv().FarmPaused then return end
+    local lp = Players.LocalPlayer
+    local char = lp and lp.Character
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+    if hrp and lockedTargetCFrame then
+        hrp.CFrame = lockedTargetCFrame
+        hrp.AssemblyLinearVelocity = Vector3.zero
+        hrp.AssemblyAngularVelocity = Vector3.zero
+    end
+end)
+
+noclipConn = RunService.Stepped:Connect(function()
+    if not running() then
+        if noclipConn then noclipConn:Disconnect() end
+        return
+    end
+    if getgenv().FarmPaused then return end
+    local lp = Players.LocalPlayer
+    local char = lp and lp.Character
+    if char then
+        for _, v in ipairs(char:GetChildren()) do
+            if v:IsA("BasePart") and v.CanCollide and v.Name ~= "AutoFarmPlatform" then
+                v.CanCollide = false
+            end
+        end
+    end
+end)
+
+local stuckTick = 0
+local lastStuckPos = Vector3.zero
+task.spawn(function()
+    while running() do
+        task.wait(1)
+        if getgenv().FarmPaused or getgenv().IsHopping then 
+            stuckTick = 0 
+            continue 
+        end
+        local lp = Players.LocalPlayer
+        local char = lp and lp.Character
+        local hrp = char and char:FindFirstChild("HumanoidRootPart")
+        if hrp then
+            if (hrp.Position - lastStuckPos).Magnitude < 1 then
+                stuckTick = stuckTick + 1
+                if stuckTick >= 40 then
+                    task.spawn(function()
+                        ServerHopLogic("Stuck for 40 seconds, hopping...")
+                    end)
+                    stuckTick = 0
+                end
+            else
+                lastStuckPos = hrp.Position
+                stuckTick = 0
+            end
+        else
+            stuckTick = 0
+        end
+    end
+end)
+
+antiStompConn = RunService.Heartbeat:Connect(function()
+    if not running() then
+        if antiStompConn then antiStompConn:Disconnect() end
+        return
+    end
+    if getgenv().FarmPaused then return end
+    local lp = Players.LocalPlayer
+    local Character2 = lp and lp.Character
+    if not Character2 then return end
+    if hasReset then return end
+    local Humanoid = Character2:FindFirstChildOfClass("Humanoid")
+    local BodyEffects = Character2:FindFirstChild("BodyEffects")
+    local v35 = BodyEffects and BodyEffects:FindFirstChild("K.O")
+    local v36 = false
+    if Humanoid and Humanoid.Health <= 5 then v36 = true end
+    if v35 and v35.Value == true then v36 = true end
+    if v36 then
+        hasReset = true
+        lockedTargetCFrame = nil
+        local head = Character2:FindFirstChild("Head")
+        local bgui = nil
+        if head then 
+            bgui = head:FindFirstChildWhichIsA("BillboardGui")
+            if bgui then bgui = bgui:Clone() end
+            pcall(function() head:Destroy() end) 
+        end
+        
+        local partsToSpoof = {"UpperTorso", "Head", "HumanoidRootPart", "LowerTorso", "Torso"}
+        for _, pName in ipairs(partsToSpoof) do
+            if not Character2:FindFirstChild(pName) then
+                local p = Instance.new("Part")
+                p.Name = pName
+                p.Transparency = 1
+                p.Parent = Character2
+                if pName == "Head" and bgui then
+                    bgui.Parent = p
+                end
+            end
+        end
+        
+        task.delay(4, function()
+            local c2 = lp.Character
+            if c2 then
+                local h2 = c2:FindFirstChild("Head")
+                if h2 then pcall(function() h2:Destroy() end) end
+            end
+        end)
+    end
+end)
+
+antiSeatConn = RunService.Heartbeat:Connect(function()
+    if not running() then
+        if antiSeatConn then antiSeatConn:Disconnect() end
+        return
+    end
+    if getgenv().FarmPaused then return end
+    local lp = Players.LocalPlayer
+    local char = lp and lp.Character
+    if not char then return end
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    if hum and hum.Sit then
+        hum.Sit = false
+        hum:ChangeState(Enum.HumanoidStateType.Jumping)
+    end
+end)
+
+local animBlockConn, animBlockAnimator
+local function setupAnimationBlocker(char)
+    local humanoid = char and char:FindFirstChildOfClass("Humanoid")
+    if not humanoid then return end
+    local animator = humanoid:FindFirstChildOfClass("Animator") or humanoid
+    if not animator then return end
+    if animBlockAnimator ~= animator then
+        if animBlockConn then animBlockConn:Disconnect() end
+        animBlockAnimator = animator
+        animBlockConn = animator.AnimationPlayed:Connect(function(track)
+            if not running() then
+                animBlockConn:Disconnect()
+                return
+            end
+            local n = string.lower(track.Name or "")
+            local id = tostring(track.Animation and track.Animation.AnimationId or "")
+            if string.find(n, "block") or string.find(n, "guard") or string.find(id, "10479335397") or string.find(id, "10480396650") then
+                pcall(function()
+                    track:Stop(0)
+                    track:Destroy()
+                end)
+            end
+        end)
+    end
+    for _, track in ipairs(animator:GetPlayingAnimationTracks()) do
+        local n = string.lower(track.Name or "")
+        local id = tostring(track.Animation and track.Animation.AnimationId or "")
+        if string.find(n, "block") or string.find(n, "guard") or string.find(id, "10479335397") or string.find(id, "10480396650") then 
+            pcall(function()
+                track:Stop(0)
+                track:Destroy()
+            end)
+        end
+    end
+end
+
+task.spawn(function()
+    while running() do
+        if not getgenv().FarmPaused then
+            task.wait(2)
+            pcall(function()
+                local lp = Players.LocalPlayer
+                local char = lp and lp.Character
+                if char then
+                    setupAnimationBlocker(char)
+                    for _, v in ipairs(char:GetChildren()) do
+                        if v:IsA("LocalScript") and string.find(string.lower(v.Name), "anticheat") then
+                            v.Disabled = true 
+                            v:Destroy() 
+                        end
+                    end
+                end
+            end)
+        else
+            task.wait(0.5)
+        end
+    end
+end)
+
+local function setupForceReset(char)
+    if not char then return end
+    setupAnimationBlocker(char)
+    local humanoid = char:WaitForChild("Humanoid", 5)
+    if not humanoid then return end
+    if humanoid.Health <= 1 then return end
+    if forceResetConn then pcall(function() forceResetConn:Disconnect() end) end
+    forceResetConn = humanoid.HealthChanged:Connect(function(health)
+        if not running() then return end
+        if getgenv().FarmPaused then return end
+        if health <= 1 and health > 0 then
+            lockedTargetCFrame = nil
+            local head = char:FindFirstChild("Head")
+            local bgui = nil
+            if head then 
+                bgui = head:FindFirstChildWhichIsA("BillboardGui")
+                if bgui then bgui = bgui:Clone() end
+                head:Destroy() 
+            else 
+                humanoid.Health = 0 
+            end
+            
+            local partsToSpoof = {"UpperTorso", "Head", "HumanoidRootPart", "LowerTorso", "Torso"}
+            for _, pName in ipairs(partsToSpoof) do
+                if not char:FindFirstChild(pName) then
+                    local p = Instance.new("Part")
+                    p.Name = pName
+                    p.Transparency = 1
+                    p.Parent = char
+                    if pName == "Head" and bgui then
+                        bgui.Parent = p
+                    end
+                end
+            end
+            
+            if forceResetConn then forceResetConn:Disconnect() end
+        end
+    end)
+end
+
+local charAddedConn
+charAddedConn = LocalPlayer.CharacterAdded:Connect(function(char)
+    if not running() then
+        charAddedConn:Disconnect()
+        return
+    end
+    currentSpawnSetup = false
+    lockedTargetCFrame = nil
+    hasReset = false
+    setupForceReset(char)
+    setupAnimationBlocker(char)
+end)
+
+if LocalPlayer.Character then
+    setupForceReset(LocalPlayer.Character)
+    setupAnimationBlocker(LocalPlayer.Character)
+end
+
+task.spawn(function()
+    local lastCash = nil
+    while running() and task.wait(0.5) do
+        if not gui or not gui.Parent then break end
+        pcall(function()
+            local lp = Players.LocalPlayer
+            local dataFolder = lp and lp:FindFirstChild("DataFolder")
+            if dataFolder then
+                local cObj = dataFolder:FindFirstChild("Currency")
+                if cObj then
+                    local currentCash = cObj.Value
+                    if lastCash ~= nil and currentCash > lastCash then
+                        local diff = currentCash - lastCash
+                        sessionMoney = sessionMoney + diff
+                        hopEarned = hopEarned + diff
+                        getgenv().SavedSessionMoney = sessionMoney
+                        onMoneyGained(diff)
+                    end
+                    lastCash = currentCash
+                end
+            end
+        end)
+    end
+end)
+
+local function BuyItem(itemName, isAmmo, clicks)
+    local t_start = tick()
+    while running() do
+        if getgenv().FarmPaused then t_start = tick(); task.wait(0.1); continue end
+        if tick() - t_start > 6 then break end
+        
+        if isDead() then return false end
+        local hrp = Players.LocalPlayer.Character and Players.LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+        if not hrp then return false end
+        
+        if not isAmmo then
+            local t = getTool(itemName)
+            if t then break end
+        end
+        
+        local part, cd, pp = findShopPart("[" .. itemName .. "]")
+        if part and hrp then
+            local targetPos = (part.CFrame * CFrame.new(0, 3, 0)).Position
+            securePosition(hrp, targetPos, part.Position)
+            for i = 1, (clicks or 1) do
+                if getgenv().FarmPaused then break end
+                if isDead() then return false end
+                triggerShopInteraction(part, cd, pp)
+                task.wait(0.2)
+            end
+            if isAmmo and not getgenv().FarmPaused then break end
+        end
+        task.wait()
+    end
+    return true
+end
+
+local function BuyFullLoadout()
+    if not running() or isDead() then return false end
+    if not getTool("Grenade") then
+        setStatus("Buying [Grenade]")
+        if not BuyItem("Grenade", false, 3) then return false end
+    end
+    if not running() or isDead() then return false end
+    if not getTool("Drum-Shotgun") then
+        setStatus("Buying [Drum-Shotgun]")
+        if not BuyItem("Drum-Shotgun", false, 1) then return false end
+    end
+    if not running() or isDead() then return false end
+    
+    local ds = getTool("Drum-Shotgun")
+    local currentAmmo = 0
+    if ds then
+        local am = ds:FindFirstChild("Ammo")
+        if am then currentAmmo = am.Value end
+    end
+    
+    if currentAmmo < 50 then
+        setStatus("Buying [Drum-Shotgun Ammo]")
+        if not BuyItem("Drum-Shotgun Ammo", true, 7) then return false end
+    end
+    return true
+end
+
+local function CollectVaultCash(baseTargetPos)
+    setStatus("Picking up cash")
+    local collectStartTime = tick()
+    while running() do
+        if getgenv().FarmPaused then collectStartTime = tick(); task.wait(0.1); continue end
+        if (tick() - collectStartTime) > 15 then break end
+        if isDead() then return false end
+        
+        local hrp = Players.LocalPlayer.Character and Players.LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+        if not hrp then return false end
+        
+        local dropFolder = workspace:FindFirstChild("Ignored") and workspace.Ignored:FindFirstChild("Drop")
+        if not dropFolder then return false end
+        local foundCash = nil
+        local closestDist = 9e9
+        
+        for _, drop in ipairs(dropFolder:GetChildren()) do
+            if drop.Name == "MoneyDrop" or string.find(string.lower(drop.Name), "money") or string.find(string.lower(drop.Name), "cash") then
+                local cashPart = drop:IsA("BasePart") and drop or drop:FindFirstChildWhichIsA("BasePart", true)
+                if cashPart then
+                    local dist = (cashPart.Position - baseTargetPos).Magnitude
+                    if dist <= 15 and dist < closestDist then
+                        closestDist = dist
+                        foundCash = drop
+                    end
+                end
+            end
+        end
+        
+        if foundCash then
+            local cashPart = foundCash:IsA("BasePart") and foundCash or foundCash:FindFirstChildWhichIsA("BasePart", true)
+            if cashPart then
+                getgenv().VaultCashAngle = (getgenv().VaultCashAngle or 0) + math.rad(math.random(45, 110))
+                local radius = math.random(5, 10)
+                local newOffset = Vector3.new(math.cos(getgenv().VaultCashAngle) * radius, math.random(1, 3), math.sin(getgenv().VaultCashAngle) * radius)
+                lastVaultCashOffset = newOffset
+
+                local targetPos = cashPart.Position + lastVaultCashOffset
+                securePosition(hrp, targetPos, cashPart.Position)
+                
+                local cd = foundCash:FindFirstChildWhichIsA("ClickDetector", true)
+                if cd then pcall(function() safeFireClick(cd) end) end
+                pcall(function() safeFireTouch(hrp, cashPart, 0) end)
+                task.wait(0.01)
+                pcall(function() safeFireTouch(hrp, cashPart, 1) end)
+                task.wait(0.15)
+            end
+        else
+            if (tick() - collectStartTime) > 1.5 then break end
+        end
+        task.wait()
+    end
+    return true
+end
+
+task.spawn(function()
+    if not getgenv().VaultWebhookSent then
+        getgenv().VaultWebhookSent = true
+        SendWebhook("Started Farm", 0)
+    end
+end)
+
+local function farmStep()
+    task.wait()
+    
+    if getgenv().IsHopping then
+        if not running() then return "stop" end
+        task.wait(1)
+        return
+    end
+    
+    while getgenv().FarmPaused and running() do
+        setStatus("PAUSED")
+        task.wait(0.1)
+    end
+    if not running() then return "stop" end
+    
+    if isDead() then
+        setStatus("Respawning")
+        lockedTargetCFrame = nil
+        task.wait(0.5)
+        return
+    end
+    
+    if not CheckVaultsExist() then
+        setStatus("Serverhopping: No vaults on join.")
+        ServerHopLogic("No active vaults found.")
+        task.wait(9e9)
+        return
+    end
+    
+    local char = LocalPlayer.Character
+    if char and char:FindFirstChildOfClass("ForceField") then
+        setStatus("Waiting for respawnshield to be off")
+        clickCenter(0.05)
+        task.wait(0.25)
+        return
+    end
+    
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+    if hrp and hrp.Position.Y < 8 then
+        hrp.AssemblyLinearVelocity = Vector3.zero
+    end
+
+    if not currentSpawnSetup and hrp and getgenv().UseMask == false then
+        currentSpawnSetup = true
+    end
+
+    if not currentSpawnSetup and hrp then
+        local rawMaskName = getgenv().mask
+        if type(rawMaskName) ~= "string" or rawMaskName == "" or not string.match(rawMaskName, "%S") then
+            local masks = {"Paintball Mask", "Ninja Mask", "Pumpkin Mask", "Skull Mask", "Hockey Mask", "Surgeon Mask"}
+            rawMaskName = masks[math.random(1, #masks)]
+            getgenv().mask = rawMaskName
+        end
+        
+        local shopMaskName = "[" .. rawMaskName .. "]"
+        setStatus("Buying " .. rawMaskName)
+        local maskTool = getTool("Mask") or getTool(rawMaskName)
+        local maskStart = tick()
+        while running() and not maskTool do
+            if getgenv().FarmPaused then maskStart = tick(); task.wait(0.1); continue end
+            if tick() - maskStart > 6 then break end
+            
+            local part, cd, pp = findShopPart(shopMaskName)
+            if part then
+                local randOffset = Vector3.new((math.random() - 0.5) * 5, 3, (math.random() - 0.5) * 5)
+                securePosition(hrp, part.Position + randOffset, part.Position)
+                triggerShopInteraction(part, cd, pp)
+            end
+            task.wait(0.1)
+            maskTool = getTool("Mask") or getTool(rawMaskName)
+        end
+        
+        maskTool = getTool("Mask") or getTool(rawMaskName)
+        if maskTool then
+            local hum = char:FindFirstChildOfClass("Humanoid")
+            if hum and maskTool.Parent ~= char then
+                hum:EquipTool(maskTool)
+                task.wait(0.05)
+            end
+            if maskTool.Parent == char then
+                clickCenter(0.05)
+                task.wait(0.05)
+                if hum then pcall(function() hum:UnequipTools() end) end
+                task.wait(0.05)
+            end
+        end
+        currentSpawnSetup = true
+        return
+    end
+    
+    if not CheckVaultsExist() then
+        setStatus("Serverhopping: All active vaults are empty.")
+        ServerHopLogic("All active vaults are empty.")
+        task.wait(9e9)
+        return
+    end
+    
+    if not BuyFullLoadout() then return end
+    
+    local MAP = workspace:FindFirstChild("MAP")
+    if MAP then MAP = MAP:FindFirstChild("Map") end
+    if MAP then MAP = MAP:FindFirstChild("Vault") end
+    local v96 = MAP and MAP:FindFirstChild("VaultPart")
+    
+    if v96 and v96.Parent then
+        local nade = getTool("Grenade")
+        if not nade then
+            setStatus("Failsafe: Re-buying [Grenade]")
+            BuyItem("Grenade", false, 3)
+            task.wait(0.5)
+            nade = getTool("Grenade")
+        end
+
+        if nade then
+            setStatus("Throwing Granade")
+            
+            local vaultCenter = v96.Position
+            local throwPos = Vector3.new(-618.6, -31.2, -285.4)
+            local dirToVault = Vector3.new(vaultCenter.X - throwPos.X, 0, vaultCenter.Z - throwPos.Z)
+            if dirToVault.Magnitude < 0.1 then
+                dirToVault = Vector3.new(0, 0, -1)
+            else
+                dirToVault = dirToVault.Unit
+            end
+            
+            local safeBackPos = throwPos - (dirToVault * 22) + Vector3.new(0, 3, 0)
+            
+            securePosition(hrp, throwPos, throwPos - Vector3.new(0, 10, 0))
+            task.wait(0.2)
+            
+            if isDead() then return end
+            
+            local cam = workspace.CurrentCamera
+            if cam then cam.CameraType = Enum.CameraType.Scriptable end
+            
+            local Head = char and char:FindFirstChild("Head")
+            if Head and cam then 
+                cam.CFrame = CFrame.new(Head.Position + Vector3.new(0, 1.5, 0), Head.Position - Vector3.new(0, 10, 0))
+            end
+            
+            if cam then
+                local camCenter = cam.ViewportSize / 2
+                lockConn = RunService.RenderStepped:Connect(function()
+                    if running() and not isDead() and not getgenv().IsHopping then
+                        pcall(function()
+                            UserInputService.MouseBehavior = Enum.MouseBehavior.LockCenter
+                            if mousemoverel then mousemoverel(0,0) end 
+                            if mousemoveabs then mousemoveabs(camCenter.X, camCenter.Y) end
+                            VIM:SendMouseMoveEvent(camCenter.X, camCenter.Y, game)
+                        end)
+                    end
+                end)
+            end
+            
+            local hum = char and char:FindFirstChild("Humanoid")
+            if hum then hum:EquipTool(nade) end
+            task.wait(0.3)
+            
+            if not isDead() then
+                pcall(function() nade:Activate() end)
+                clickCenter(0.01)
+
+                task.wait(0.5)
+
+                if nade and char == nade.Parent then
+                    pcall(function() nade:Activate() end)
+                    clickCenter(0.01)
+                end
+            end
+            
+            task.wait(0.5)
+            securePosition(hrp, safeBackPos, vaultCenter)
+            
+            task.wait(4.0)
+            
+            if lockConn then lockConn:Disconnect() end
+            pcall(function() UserInputService.MouseBehavior = Enum.MouseBehavior.Default end)
+            if cam then cam.CameraType = Enum.CameraType.Custom end
+            if cam and hum then cam.CameraSubject = hum end
+            if hum then hum:UnequipTools() end
+        end
+    end
+    
+    if isDead() then return end
+    while getgenv().FarmPaused and running() do task.wait(0.1) end
+    if not running() then return "stop" end
+    
+    local Cashiers = workspace:FindFirstChild("Cashiers")
+    if Cashiers then
+        local brokenVaults = {}
+        for _, v in ipairs(Cashiers:GetChildren()) do
+            if isDead() or not running() or getgenv().IsHopping then break end
+            if not string.find(string.upper(v.Name), "VAULT") then continue end
+            local Humanoid2 = v:FindFirstChildOfClass("Humanoid")
+            local Head = v:FindFirstChild("Head") or v:FindFirstChild("Part")
+            if not (Humanoid2 and Humanoid2.Health > 0 and Head) then continue end
+            local ds = getTool("Drum-Shotgun")
+            if not ds then break end
+            
+            setStatus("Breaking Vaults")
+            local hum = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("Humanoid")
+            if hum then hum:EquipTool(ds) end
+            task.wait(0.2)
+            if isDead() then break end
+            
+            LocalPlayer.CameraMode = Enum.CameraMode.LockFirstPerson
+            local sideLook = Head.CFrame.RightVector * (math.random() > 0.5 and 5 or -5)
+            local breakPos = Head.CFrame * CFrame.new(0, 0, 3.5).Position
+            
+            while Humanoid2 and Humanoid2.Health > 0 and v.Parent and running() and not isDead() and not getgenv().IsHopping and not getgenv().FarmPaused do
+                local hrp = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+                securePosition(hrp, breakPos + sideLook, Head.Position)
+                
+                local cam = workspace.CurrentCamera
+                if cam then
+                    cam.CFrame = CFrame.lookAt(cam.CFrame.Position, Head.Position)
+                end
+                
+                local Ammo = ds:FindFirstChild("Ammo")
+                if Ammo and Ammo.Value <= 0 then
+                    local MainEvent = game:GetService("ReplicatedStorage"):FindFirstChild("MainEvent")
+                    if MainEvent then MainEvent:FireServer("Reload", ds) end
+                    task.wait(1.5)
+                    if isDead() then break end
+                    securePosition(hrp, breakPos + sideLook, Head.Position)
+                end
+                
+                clickCenter(0.05)
+            end
+            
+            if isDead() then break end
+            table.insert(brokenVaults, Head.Position)
+        end
+        
+        local finalHum = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("Humanoid")
+        if finalHum then finalHum:UnequipTools() end
+        LocalPlayer.CameraMode = Enum.CameraMode.Classic
+        task.wait(0.1)
+        
+        for _, pos in ipairs(brokenVaults) do
+            if isDead() or not running() or getgenv().IsHopping then break end
+            if not CollectVaultCash(pos) then break end
+        end
+    end
+    
+    if isDead() then return end
+    
+    if not CheckVaultsExist() then
+        setStatus("Serverhopping: All vaults cleared successfully.")
+        ServerHopLogic("All vaults cleared successfully.")
+        task.wait(1)
+    end
+end
+
+-- every pass of the farm runs protected: an unexpected error is reported, the camera and mouse
+-- are handed back, and the farm carries on instead of silently dying
+local consecutiveErrors = 0
+while running() do
+    local ok, result = pcall(farmStep)
+    if ok then
+        consecutiveErrors = 0
+        if result == "stop" then break end
+    else
+        consecutiveErrors = consecutiveErrors + 1
+        warn("[Vault Farm] " .. tostring(result))
+        if lockConn then pcall(function() lockConn:Disconnect() end) end
+        lockedTargetCFrame = nil
+        pcall(function()
+            if gui.Parent then gui.Enabled = true end
+            UserInputService.MouseBehavior = Enum.MouseBehavior.Default
+            LocalPlayer.CameraMode = Enum.CameraMode.Classic
+            local cam = workspace.CurrentCamera
+            cam.CameraType = Enum.CameraType.Custom
+            local hum = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
+            if hum then cam.CameraSubject = hum end
+        end)
+        if consecutiveErrors == 1 or consecutiveErrors % 5 == 0 then
+            notify("Recovered from an error", (string.gsub(tostring(result), "^.-:%d+: ", "")), Theme.Gold)
+        end
+        if consecutiveErrors >= 10 then
+            -- something in this server keeps breaking the farm; a fresh server usually fixes it
+            consecutiveErrors = 0
+            ServerHopLogic("Too many errors, switching server")
+        end
+        task.wait(math.min(consecutiveErrors, 5))
+    end
+end
+]====]
+
+pcall(function()
+    if writefile then
+        writefile("DHC_Cache.lua", "")
+        writefile("Vault_Cache.lua", VaultFarmCode)
+    end
+end)
+
+local func = loadstring(VaultFarmCode)
+if func then
+    task.spawn(func)
+end
