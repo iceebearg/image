@@ -219,20 +219,11 @@ for _, name in ipairs({"AutoFarmPlatform", "VaultFarmCamera"}) do
     if old then old:Destroy() end
 end
 
-local safePlatform = Instance.new("Part")
-safePlatform.Name = "AutoFarmPlatform"
-safePlatform.Size = Vector3.new(5, 1, 5)
-safePlatform.Transparency = 1
-safePlatform.Anchored = true
-safePlatform.CanCollide = true
-safePlatform.Parent = workspace
-
 local lockedTargetCFrame = nil
 
 local function securePosition(hrp, targetPos, lookData)
     if getgenv().FarmPaused then return end
     if hrp and targetPos then
-        safePlatform.CFrame = CFrame.new(targetPos.X, targetPos.Y - 3.5, targetPos.Z)
         local myPos = Vector3.new(targetPos.X, targetPos.Y - 0.5, targetPos.Z)
         if typeof(lookData) == "Vector3" then
             if (lookData - myPos).Magnitude > 0.01 then
@@ -251,8 +242,22 @@ local function securePosition(hrp, targetPos, lookData)
             lockedTargetCFrame = CFrame.new(myPos) * hrp.CFrame.Rotation
         end
         hrp.CFrame = lockedTargetCFrame
-        hrp.AssemblyLinearVelocity = Vector3.zero
+        local char = hrp.Parent
+        local hum = char and char:FindFirstChildOfClass("Humanoid")
+        if hum then
+            hum:ChangeState(Enum.HumanoidStateType.Freefall)
+        end
+        hrp.AssemblyLinearVelocity = Vector3.new(0, -35, 0)
         hrp.AssemblyAngularVelocity = Vector3.zero
+
+        pcall(function()
+            local touching = workspace:GetPartsInPart(hrp)
+            for _, part in ipairs(touching) do
+                if part and not part:IsDescendantOf(char) and part.CanCollide then
+                    part.CanCollide = false
+                end
+            end
+        end)
     end
 end
 
@@ -1907,9 +1912,8 @@ local function UnloadEverything()
     end)
     
     pcall(function()
-        if safePlatform and safePlatform.Parent then
-            safePlatform:Destroy()
-        end
+        local plat = workspace:FindFirstChild("AutoFarmPlatform")
+        if plat then plat:Destroy() end
     end)
     
     local char = LocalPlayer and LocalPlayer.Character
@@ -1967,7 +1971,11 @@ lockHeartbeatConn = RunService.Heartbeat:Connect(function()
     local hrp = char and char:FindFirstChild("HumanoidRootPart")
     if hrp and lockedTargetCFrame then
         hrp.CFrame = lockedTargetCFrame
-        hrp.AssemblyLinearVelocity = Vector3.zero
+        local hum = char:FindFirstChildOfClass("Humanoid")
+        if hum then
+            hum:ChangeState(Enum.HumanoidStateType.Freefall)
+        end
+        hrp.AssemblyLinearVelocity = Vector3.new(0, -35, 0)
         hrp.AssemblyAngularVelocity = Vector3.zero
     end
 end)
@@ -1986,6 +1994,18 @@ noclipConn = RunService.Stepped:Connect(function()
             if v:IsA("BasePart") and v.CanCollide then
                 v.CanCollide = false
             end
+        end
+        -- disable collision on any world part touching or intersecting the character
+        local hrp = char:FindFirstChild("HumanoidRootPart")
+        if hrp then
+            pcall(function()
+                local touching = workspace:GetPartsInPart(hrp)
+                for _, part in ipairs(touching) do
+                    if part and not part:IsDescendantOf(char) and part.CanCollide then
+                        part.CanCollide = false
+                    end
+                end
+            end)
         end
         -- no animations and no auto-turning: the body stays frozen, so the hand (and the gun's grip
         -- that hangs off it) never shifts and the gun stays put in the middle of the vault
@@ -2517,6 +2537,44 @@ local function getVaultDoor()
     return vault and vault:FindFirstChild("VaultPart")
 end
 
+local function getBankCeilingPart()
+    local part
+    pcall(function()
+        local stairs = workspace.MAP.Map.bank.bank.bank.Stairs.Stairs.Stairs.Stairs
+        local ch = stairs:GetChildren()
+        if ch and ch[4] and ch[4]:IsA("BasePart") then
+            part = ch[4]
+        end
+    end)
+    if not part then
+        pcall(function()
+            local s = workspace:FindFirstChild("MAP")
+            s = s and s:FindFirstChild("Map")
+            s = s and s:FindFirstChild("bank")
+            s = s and s:FindFirstChild("bank")
+            s = s and s:FindFirstChild("bank")
+            s = s and s:FindFirstChild("Stairs")
+            s = s and s:FindFirstChild("Stairs")
+            s = s and s:FindFirstChild("Stairs")
+            s = s and s:FindFirstChild("Stairs")
+            if s then
+                local children = s:GetChildren()
+                if children[4] and children[4]:IsA("BasePart") then
+                    part = children[4]
+                else
+                    for _, obj in ipairs(children) do
+                        if obj:IsA("BasePart") and math.abs(obj.Size.Y - 2.75) < 0.5 then
+                            part = obj
+                            break
+                        end
+                    end
+                end
+            end
+        end)
+    end
+    return part
+end
+
 local function blowDoorWithGrenadeTP(char, hrp, door)
     local tool = getTool("Grenade")
     local hum = char and char:FindFirstChildOfClass("Humanoid")
@@ -2674,30 +2732,59 @@ local function shootVaultsWhileCollecting()
     -- and stays at the menu's gun reach; it goes back to the center as soon as we're close again.
     local bulletTP = getgenv().BulletTPVaults ~= false and support.bulletTP
     local roomCenter = GUN_SPOT
-    local gripConn
-    if bulletTP then
-        gripConn = RunService.Heartbeat:Connect(function()
-            -- also lets go on its own if the farm stops or errors out mid-phase
-            if not running() or not ds.Parent then
-                gripConn:Disconnect()
-                return
+    local gripConns = {}
+
+    local function updateGrip()
+        if not running() or not ds.Parent then
+            for _, c in ipairs(gripConns) do pcall(function() c:Disconnect() end) end
+            return
+        end
+        local char = LocalPlayer.Character
+        local hand = char and (char:FindFirstChild("RightHand") or char:FindFirstChild("Right Arm"))
+        local weld = hand and hand:FindFirstChild("RightGrip")
+        local root = char and char:FindFirstChild("HumanoidRootPart")
+        if weld and root and ds.Parent == char then
+            local spot = roomCenter
+            local ceilPart = getBankCeilingPart()
+            if ceilPart then
+                local ceilPos = ceilPart.Position
+                local ceilHalf = ceilPart.Size / 2
+                -- Clampeado estricto: la Y se mantiene adentro del bloque del techo del banco para ocultar el arma
+                local minY = ceilPos.Y - ceilHalf.Y + 0.2
+                local maxY = ceilPos.Y + ceilHalf.Y - 0.2
+                spot = Vector3.new(spot.X, math.clamp(spot.Y, minY, maxY), spot.Z)
             end
-            local char = LocalPlayer.Character
-            local hand = char and char:FindFirstChild("RightHand")
-            local weld = hand and hand:FindFirstChild("RightGrip")
-            local root = char and char:FindFirstChild("HumanoidRootPart")
-            if weld and root and ds.Parent == char then
-                local spot = roomCenter
-                local away = roomCenter - root.Position
-                local reach = gunReach()
-                if away.Magnitude > reach then
-                    spot = root.Position + away.Unit * reach
+
+            local away = spot - root.Position
+            local reach = gunReach()
+            if away.Magnitude > reach then
+                local clamped = root.Position + away.Unit * reach
+                if ceilPart then
+                    local ceilPos = ceilPart.Position
+                    local ceilHalf = ceilPart.Size / 2
+                    local minY = ceilPos.Y - ceilHalf.Y + 0.1
+                    local maxY = ceilPos.Y + ceilHalf.Y - 0.1
+                    spot = Vector3.new(clamped.X, math.clamp(clamped.Y, minY, maxY), clamped.Z)
+                else
+                    spot = clamped
                 end
-                local target = CFrame.new(spot)
-                -- Handle = hand * C0 * C1:Inverse(), solved for the C1 that puts Handle on target
-                weld.C1 = target:Inverse() * hand.CFrame * weld.C0
             end
-        end)
+
+            local target = CFrame.new(spot)
+            -- Handle = hand * C0 * C1:Inverse(), solved for the C1 that puts Handle on target
+            weld.C1 = target:Inverse() * hand.CFrame * weld.C0
+        end
+    end
+
+    if bulletTP then
+        -- Aplicacion instantanea en frame 0
+        updateGrip()
+
+        -- Multi-stage hook: RenderStepped asegura que el arma este clavada en el techo ANTES de dibujarse en pantalla,
+        -- y Stepped/Heartbeat sincronizan los pasos de fisica y el raycast balistico sin delay ni animacion visible.
+        table.insert(gripConns, RunService.RenderStepped:Connect(updateGrip))
+        table.insert(gripConns, RunService.Stepped:Connect(updateGrip))
+        table.insert(gripConns, RunService.Heartbeat:Connect(updateGrip))
     end
 
     -- we're hidden under the floor, so the camera watches the vault room from a fixed invisible part
@@ -2826,7 +2913,7 @@ local function shootVaultsWhileCollecting()
     end)
     phase.active = false
     getgenv().VaultAimPosition = nil
-    if gripConn then gripConn:Disconnect() end
+    for _, c in ipairs(gripConns) do pcall(function() c:Disconnect() end) end
     -- unequipping drops the weld, so the next equip starts from the tool's normal grip
     pcall(function() hum:UnequipTools() end)
     pcall(function() workspace.CurrentCamera.CameraSubject = hum end)
@@ -2873,7 +2960,9 @@ local function farmStep()
     
     local hrp = char and char:FindFirstChild("HumanoidRootPart")
     if hrp and hrp.Position.Y < 8 then
-        hrp.AssemblyLinearVelocity = Vector3.zero
+        local hum = char and char:FindFirstChildOfClass("Humanoid")
+        if hum then hum:ChangeState(Enum.HumanoidStateType.Freefall) end
+        hrp.AssemblyLinearVelocity = Vector3.new(0, -35, 0)
     end
 
     if not currentSpawnSetup and hrp and getgenv().UseMask == false then
